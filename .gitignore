@@ -1,0 +1,26 @@
+# Python 가상환경
+venv/
+__pycache__/
+*.pyc
+
+# Mac 숨김파일
+.DS_Store
+
+# 환경 설정
+.env
+
+# Google Cloud 인증키 (절대 올리면 안 됨!)
+*.json
+
+# Streamlit 캐시
+.streamlit/
+
+# VS Code 설정
+.vscode/
+
+# Google Cloud SDK (로컬 전용, 절대 올리면 안 됨)
+google-cloud-sdk/
+google-cloud-cli-*.tar.gz
+
+# brew 설치 흔적 제거
+source "*/"
