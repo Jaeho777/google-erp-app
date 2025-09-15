@@ -1,4 +1,4 @@
-# 🌿 IMC GCP ERP 프로젝트 실행 매뉴얼 (팀원용, 로컬 무조건 실행 가능 버전)
+# 🌿 IMC GCP ERP 프로젝트 실행 매뉴얼 (GITHUB 사용)
 
 ---
 
@@ -139,3 +139,80 @@ git push origin feature-내이름
 ```
 
 👉 팀장이 검토 후 합칩니다.
+
+---
+좋은 질문이에요 👍
+팀원들이 **깃허브나 클라우드 설치 없이 그냥 파일 받아서 실행**하고 싶다면,
+훨씬 더 단순하게 진행할 수 있어요.
+
+---
+
+# 📦 파일 받아서 실행하기 (GITHUB 미사용)
+
+---
+
+## 0. 준비물
+
+* 팀장이 압축파일(`google-erp-app.zip`)과 `erp-key.json`을 전달해줌
+* Python 3.10 이상만 설치되어 있으면 됨
+
+---
+
+## 1. 압축 풀기
+
+1. 바탕화면에 `google-erp-app.zip`을 저장
+2. 압축 풀어서 `google-erp-app` 폴더 확인
+
+---
+
+## 2. 터미널에서 폴더 들어가기
+
+```bash
+cd ~/Desktop/google-erp-app
+```
+
+---
+
+## 3. 가상환경 만들기
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+---
+
+## 4. 라이브러리 설치
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+## 5. 서비스 키 파일 넣기
+
+1. `erp-key.json` 파일을 `google-erp-app` 폴더 안에 복사
+2. 환경 변수 설정:
+
+   ```bash
+   export GOOGLE_APPLICATION_CREDENTIALS="$HOME/Desktop/google-erp-app/erp-key.json"
+   ```
+
+---
+
+## 6. 앱 실행
+
+```bash
+streamlit run app.py
+```
+
+👉 자동으로 브라우저 열리고,
+👉 `http://localhost:8501` 에서 ERP 대시보드 확인 가능
+
+---
+
+## 7. 개발 참여가 필요 없다면
+
+팀원들은 그냥 **로컬에서 실행해서 보고, 의견만 전달**하면 됩니다.
+(코드 수정이나 깃허브 푸시는 안 해도 됨)
