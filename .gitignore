@@ -22,5 +22,5 @@ __pycache__/
 google-cloud-sdk/
 google-cloud-cli-*.tar.gz
 
-# brew 설치 흔적 제거
+# brew 설치 흔적 제거!@!!!!
 source "*/"
