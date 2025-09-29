@@ -3,11 +3,16 @@ from google.cloud import bigquery
 import plotly.express as px
 import pandas as pd
 
+import os
+
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/jaeholee/Desktop/google-erp-app/keys/service-account.json"
+
+
 # ✅ 서비스 계정 인증
-client = bigquery.Client(location="asia-northeast3")
+client = bigquery.Client(location="US")
 
 # ✅ 프로젝트/데이터셋/테이블 정보
-PROJECT_ID = "artful-logic-472014-q3"
+PROJECT_ID = "noted-branch-473510-r5"
 DATASET = "erp_dataset"
 
 # 원본 매출 테이블 (스마트스토어 데이터)
@@ -51,8 +56,8 @@ elif menu == "대시보드":
 
     # 원본 테이블 + 입력 테이블 합치기
     query = f"""
-    SELECT 
-  DATE(SAFE.PARSE_DATETIME('%Y.%m.%d %H:%M', `구매확정일`)) AS date,
+SELECT 
+  DATE(PARSE_DATETIME('%Y.%m.%d %H:%M', `구매확정일`)) AS date,   -- 문자열을 DATE로 변환
   `상품명` AS product,
   CAST(`수량` AS INT64) AS qty,
   CAST(REGEXP_REPLACE(`최종 상품별 총 주문금액`, r'[^0-9]', '') AS INT64) AS revenue
@@ -61,13 +66,15 @@ FROM `{SOURCE_TABLE}`
 UNION ALL
 
 SELECT 
-  PARSE_DATE('%Y-%m-%d', date) AS date,
+  CAST(date AS DATE) AS date,   -- 입력 테이블: 이미 DATE/STRING이면 이 정도로 충분
   product,
   CAST(qty AS INT64),
   CAST(revenue AS INT64)
 FROM `{INPUT_TABLE}`
 
-    """
+"""
+
+
 
     df = client.query(query).to_dataframe()
 

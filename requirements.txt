@@ -5,6 +5,7 @@ cachetools==5.5.2
 certifi==2025.8.3
 charset-normalizer==3.4.3
 click==8.2.1
+db-dtypes==1.4.3
 gitdb==4.0.12
 GitPython==3.1.45
 google-api-core==2.25.1
@@ -48,8 +49,3 @@ tornado==6.5.2
 typing_extensions==4.15.0
 tzdata==2025.2
 urllib3==2.5.0
-streamlit
-google-cloud-bigquery
-pandas
-plotly
-db-dtypes
