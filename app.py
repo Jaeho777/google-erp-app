@@ -57,22 +57,28 @@ elif menu == "대시보드":
     # 원본 테이블 + 입력 테이블 합치기
     query = f"""
 SELECT 
-  DATE(PARSE_DATETIME('%Y.%m.%d %H:%M', `구매확정일`)) AS date,   -- 문자열을 DATE로 변환
-  `상품명` AS product,
-  CAST(`수량` AS INT64) AS qty,
-  CAST(REGEXP_REPLACE(`최종 상품별 총 주문금액`, r'[^0-9]', '') AS INT64) AS revenue
-FROM `{SOURCE_TABLE}`
+      DATE(SAFE.PARSE_DATETIME('%Y.%m.%d %H:%M', CAST(`구매확정일` AS STRING))) AS date,
+      `상품명` AS product,
+      CAST(`수량` AS INT64) AS qty,
+      CAST(REGEXP_REPLACE(`최종 상품별 총 주문금액`, '[^0-9]','') AS INT64) AS revenue
+    FROM `{SOURCE_TABLE}`
 
-UNION ALL
+    UNION ALL
 
-SELECT 
-  CAST(date AS DATE) AS date,   -- 입력 테이블: 이미 DATE/STRING이면 이 정도로 충분
-  product,
-  CAST(qty AS INT64),
-  CAST(revenue AS INT64)
-FROM `{INPUT_TABLE}`
+    SELECT 
+      COALESCE(
+        SAFE.PARSE_DATE('%Y-%m-%d', CAST(`date` AS STRING)),   -- 문자열 "YYYY-MM-DD"
+        DATE(SAFE_CAST(`date` AS TIMESTAMP), 'Asia/Seoul'),    -- TIMESTAMP일 때 KST 기준
+        SAFE_CAST(`date` AS DATE)                              -- 이미 DATE면 그대로
+      ) AS date,
+      product,
+      CAST(qty AS INT64),
+      CAST(revenue AS INT64)
+    FROM `{INPUT_TABLE}`
+
 
 """
+
 
 
 
@@ -99,7 +105,7 @@ elif menu == "데이터 관리":
     st.header("🛠 데이터 관리 (수정/삭제)")
 
     query = f"SELECT * FROM `{INPUT_TABLE}` ORDER BY date DESC"
-    df_input = client.query(query).to_dataframe()
+    df_input = client.query(query).to_dataframe().copy(deep=True)
 
     if df_input.empty:
         st.info("아직 입력된 데이터가 없습니다.")
