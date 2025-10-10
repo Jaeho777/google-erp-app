@@ -5,7 +5,7 @@ import pandas as pd
 
 import os
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/jaeholee/Desktop/google-erp-app/keys/service-account.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/iseojin/Desktop/google-erp-app/keys/service-account.json"
 
 
 # ✅ 서비스 계정 인증

@@ -24,3 +24,6 @@ google-cloud-cli-*.tar.gz
 
 # brew 설치 흔적 제거!@!!!!
 source "*/"
+
+# Google service account key
+serviceAccountKey.json
