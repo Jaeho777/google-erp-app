@@ -13,7 +13,7 @@ from firebase_admin import credentials, firestore
 # 0️⃣ Firebase 초기화
 # ----------------------
 if not firebase_admin._apps:
-    cred = credentials.Certificate("/Users/iseojin/Desktop/google-erp-app/serviceAccountKey.json")
+    cred = credentials.Certificate("/Users/jaeholee/Desktop/google-erp-app/keys/serviceAccount.json")
     firebase_admin.initialize_app(cred)
 db = firestore.client()
 collection_name = "coffee_sales"
@@ -111,7 +111,7 @@ st.markdown("""
 # ----------------------
 @st.cache_data(ttl=0)
 def load_csv():
-    df = pd.read_csv("/Users/iseojin/Desktop/google-erp-app/Coffee Shop Sales.csv")
+    df = pd.read_csv("/Users/jaeholee/Desktop/google-erp-app/Coffee Shop Sales.csv")
 
     df = df.rename(columns={
         'transaction_id': '거래번호',
