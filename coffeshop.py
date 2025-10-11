@@ -7,42 +7,99 @@
 #  - 도움말 탭 + SKU 파라미터(리드타임/세이프티/목표일수/레시피g) + ROP 지표/권장발주
 # ==============================================================
 
+import os
+import re
+import warnings
+from math import ceil
+from pathlib import Path
+from datetime import datetime
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.io as pio
+
 import firebase_admin
 from firebase_admin import credentials, firestore
-from datetime import datetime
-from pathlib import Path
-from math import ceil
-import re
 
 # ----------------------
-# 0️⃣ 경로/상수 설정
+# 0️⃣ 경로/상수 (팀원이 어디서 받아도 동작)
 # ----------------------
-SERVICE_ACCOUNT_PATH = "/Users/jaeholee/Desktop/google-erp-app/keys/serviceAccount.json"
-CSV_PATH = "/Users/jaeholee/Desktop/google-erp-app/Coffee Shop Sales.csv"
-PIPELINE_IMG = "/Users/jaeholee/Desktop/google-erp-app/assets/pipeline_diagram.png"
+BASE_DIR = Path(__file__).resolve().parent
 
-SALES_COLLECTION = "coffee_sales"
-INVENTORY_COLLECTION = "inventory"
-ORDERS_COLLECTION = "orders"
-SKU_PARAMS_COLLECTION = "sku_params"   # ★ 추가: SKU 파라미터 저장 컬렉션
+# st.secrets 없을 때도 안전
+try:
+    SECRETS = dict(st.secrets)
+except Exception:
+    SECRETS = {}
+
+def _resolve_path(val, default: Path) -> Path:
+    """상대경로면 BASE_DIR 기준으로 절대경로로 변환"""
+    if not val:
+        return default
+    p = Path(str(val))
+    return p if p.is_absolute() else (BASE_DIR / p)
+
+DATA_DIR   = _resolve_path(SECRETS.get("DATA_DIR")   or os.environ.get("ERP_DATA_DIR"),   BASE_DIR / "data")
+ASSETS_DIR = _resolve_path(SECRETS.get("ASSETS_DIR") or os.environ.get("ERP_ASSETS_DIR"), BASE_DIR / "assets")
+KEYS_DIR   = _resolve_path(SECRETS.get("KEYS_DIR")   or os.environ.get("ERP_KEYS_DIR"),   BASE_DIR / "keys")
+
+CSV_PATH     = DATA_DIR / "Coffee Shop Sales.csv"
+PIPELINE_IMG = ASSETS_DIR / "pipeline_diagram.png"
+SA_FILE_PATH = KEYS_DIR / "serviceAccount.json"
+
+SALES_COLLECTION      = "coffee_sales"
+INVENTORY_COLLECTION  = "inventory"
+ORDERS_COLLECTION     = "orders"
+SKU_PARAMS_COLLECTION = "sku_params"
 
 USE_KRW_CONVERSION = False   # CSV가 USD면 True로
 KRW_PER_USD = 1350
 
-DEFAULT_INITIAL_STOCK = 100
+DEFAULT_INITIAL_STOCK   = 100
 REORDER_THRESHOLD_RATIO = 0.15  # 15%
 
+# 디렉토리 준비
+for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR):
+    p.mkdir(parents=True, exist_ok=True)
+
 # ----------------------
-# 0-1️⃣ Firebase 초기화
+# 0-1️⃣ Firebase 초기화 (Secrets → keys/ → GOOGLE_APPLICATION_CREDENTIALS)
 # ----------------------
-if not firebase_admin._apps:
-    cred = credentials.Certificate(SERVICE_ACCOUNT_PATH)
-    firebase_admin.initialize_app(cred)
-db = firestore.client()
+def init_firestore():
+    if firebase_admin._apps:
+        return firestore.client()
+
+    # 1) st.secrets 딕셔너리(권장)
+    svc_dict = SECRETS.get("firebase_service_account")
+    if isinstance(svc_dict, dict) and svc_dict:
+        cred = credentials.Certificate(svc_dict)
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+
+    # 2) keys/serviceAccount.json
+    if SA_FILE_PATH.exists():
+        cred = credentials.Certificate(str(SA_FILE_PATH))
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+
+    # 3) GOOGLE_APPLICATION_CREDENTIALS (파일 경로)
+    gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if gac and Path(gac).expanduser().exists():
+        firebase_admin.initialize_app()
+        return firestore.client()
+
+    # 4) 전부 실패 → 명시적으로 에러
+    st.error(
+        "Firebase 자격증명을 찾을 수 없습니다.\n"
+        "다음 중 하나를 설정하세요:\n"
+        "• st.secrets['firebase_service_account'] 딕셔너리\n"
+        "• keys/serviceAccount.json 파일\n"
+        "• 환경변수 GOOGLE_APPLICATION_CREDENTIALS=자격증명파일경로"
+    )
+    st.stop()
+
+db = init_firestore()
 
 # ----------------------
 # 0-2️⃣ UI/스타일
@@ -77,7 +134,6 @@ st.markdown("""
 # ----------------------
 # 0-3️⃣ 한글 매핑 테이블
 # ----------------------
-# (1) 카테고리: EN→KO
 category_map = {
     "Coffee": "커피", "Tea": "차", "Bakery": "베이커리",
     "Coffee beans": "원두", "Drinking Chocolate": "초코음료",
@@ -98,7 +154,6 @@ rev_category_map.update({
     "커피": "Coffee",
 })
 
-# (2) 타입: EN→KO
 type_map = {
     "Barista Espresso": "바리스타 에스프레소",
     "Biscotti": "비스코티",
@@ -119,7 +174,6 @@ type_map = {
     "Housewares": "생활용품",
     "Organic Beans": "유기농 원두",
     "Organic Chocolate": "유기농 초콜릿",
-
     "Organic brewed coffee": "유기농 브루드 커피",
     "Premium brewed coffee": "프리미엄 브루드 커피",
     "Premium Beans": "프리미엄 원두",
@@ -136,7 +190,6 @@ type_map = {
     "Cappuccino": "카푸치노",
     "Mocha": "모카",
     "Flat White": "플랫화이트",
-
     "Premium beans": "프리미엄 원두",
     "Regular Syrup": "일반 시럽",
     "Sugar Free Syrup": "무설탕 시럽",
@@ -145,7 +198,6 @@ type_map = {
 }
 rev_type_map = {v: k for k, v in type_map.items()}
 
-# (3) 상세: 규칙 기반(사이즈 자동 인식) + 상세 베이스 대량 매핑
 SIZE_SUFFIX_MAP = {"Lg": "라지", "Rg": "레귤러", "Sm": "스몰"}
 REV_SIZE_SUFFIX_MAP = {"라지": "Lg", "레귤러": "Rg", "스몰": "Sm"}
 
@@ -224,7 +276,6 @@ def from_korean_detail(display: str) -> str:
         return f"{base_en} {REV_SIZE_SUFFIX_MAP[size_ko]}"
     return base_en
 
-# 요일 한글화
 weekday_map = {"Monday": "월", "Tuesday": "화", "Wednesday": "수",
                "Thursday": "목", "Friday": "금", "Saturday": "토", "Sunday": "일"}
 weekday_order_kr = ["월", "화", "수", "목", "금", "토", "일"]
@@ -233,10 +284,39 @@ def map_series(s: pd.Series, mapping: dict) -> pd.Series:
     return s.apply(lambda x: mapping.get(x, x))
 
 # ----------------------
-# 1️⃣ CSV 로드
+# ✅ 날짜 파서: 명시 형식 우선 + 경고없는 폴백
+# ----------------------
+def parse_mixed_dates(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    patterns = [
+        (r'^\d{4}-\d{2}-\d{2}$', '%Y-%m-%d'),
+        (r'^\d{4}/\d{2}/\d{2}$', '%Y/%m/%d'),
+        (r'^\d{2}/\d{2}/\d{4}$', '%m/%d/%Y'),
+        (r'^\d{2}-\d{2}-\d{4}$', '%m-%d-%Y'),
+        (r'^\d{4}\.\d{2}\.\d{2}$', '%Y.%m.%d'),
+        (r'^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$', '%Y-%m-%d %H:%M:%S'),
+        (r'^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}:\d{2}$', '%m/%d/%Y %H:%M:%S'),
+    ]
+    for pat, fmt in patterns:
+        mask = s.str.match(pat)
+        if mask.any():
+            out.loc[mask] = pd.to_datetime(s.loc[mask], format=fmt, errors='coerce')
+    remain = out.isna()
+    if remain.any():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            out.loc[remain] = pd.to_datetime(s.loc[remain], errors='coerce')
+    return out
+
+# ----------------------
+# 1️⃣ CSV 로드 (샘플 생성 없음)
 # ----------------------
 @st.cache_data(ttl=0)
-def load_csv(path: str) -> pd.DataFrame:
+def load_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        st.error(f"CSV를 찾을 수 없습니다. data/ 폴더에 'Coffee Shop Sales.csv'를 넣어주세요.\n(현재 찾는 경로: {path})")
+        st.stop()
     df = pd.read_csv(path)
     df = df.rename(columns={
         'transaction_id': '거래번호', 'transaction_date': '날짜', 'transaction_time': '시간',
@@ -250,7 +330,9 @@ def load_csv(path: str) -> pd.DataFrame:
         df['수익'] *= KRW_PER_USD
         df['단가'] *= KRW_PER_USD
 
-    df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
+    # ✅ 경고 없는 날짜 파싱
+    df['날짜'] = parse_mixed_dates(df['날짜'])
+
     if '시간' in df.columns:
         df['시'] = pd.to_datetime(df['시간'], format='%H:%M:%S', errors='coerce').dt.hour
     else:
@@ -272,7 +354,10 @@ def load_sales_from_firestore() -> pd.DataFrame:
     if df_fb.empty:
         return df_fb
 
-    df_fb['날짜'] = pd.to_datetime(df_fb['날짜'], errors='coerce')
+    # ✅ 경고 없는 날짜 파싱
+    if '날짜' in df_fb.columns:
+        df_fb['날짜'] = parse_mixed_dates(df_fb['날짜'])
+
     if '수익' in df_fb.columns:
         df_fb['수익'] = pd.to_numeric(df_fb['수익'], errors='coerce')
     if '단가' in df_fb.columns:
@@ -303,7 +388,10 @@ def load_sales_with_id():
     if df_raw.empty:
         return df_raw, df_raw
 
-    df_raw['날짜'] = pd.to_datetime(df_raw['날짜'], errors='coerce')
+    # ✅ 경고 없는 날짜 파싱
+    if '날짜' in df_raw.columns:
+        df_raw['날짜'] = parse_mixed_dates(df_raw['날짜'])
+
     if '수익' in df_raw: df_raw['수익'] = pd.to_numeric(df_raw['수익'], errors='coerce')
     if '단가' in df_raw: df_raw['단가'] = pd.to_numeric(df_raw['단가'], errors='coerce')
     if '수량' in df_raw: df_raw['수량'] = pd.to_numeric(df_raw['수량'], errors='coerce')
@@ -391,7 +479,6 @@ def load_sku_params_df() -> pd.DataFrame:
         dfp = pd.DataFrame(columns=[
             "_id","sku_en","lead_time_days","safety_stock_units","target_days","grams_per_cup","expiry_days"
         ])
-    # 기본값 보강
     for col, default in [
         ("lead_time_days", 3), ("safety_stock_units", 10),
         ("target_days", 21), ("grams_per_cup", 18.0), ("expiry_days", 28)
@@ -426,7 +513,6 @@ def compute_replenishment_metrics(df_all_sales: pd.DataFrame, df_inv: pd.DataFra
     if df_inv.empty:
         return pd.DataFrame()
 
-    # 판매 윈도우
     if "날짜" in df_all_sales.columns and pd.api.types.is_datetime64_any_dtype(df_all_sales["날짜"]):
         max_day = df_all_sales["날짜"].max()
         min_day = max_day - pd.Timedelta(days=window_days-1)
@@ -434,14 +520,12 @@ def compute_replenishment_metrics(df_all_sales: pd.DataFrame, df_inv: pd.DataFra
     else:
         df_win = df_all_sales.copy()
 
-    # KO 표시 → EN SKU 키
     if "상품상세" in df_win.columns:
         df_win = df_win.copy()
         df_win["sku_en"] = df_win["상품상세"].apply(from_korean_detail)
     else:
         df_win["sku_en"] = ""
 
-    # 수량 numeric
     if "수량" in df_win.columns:
         df_win["수량"] = pd.to_numeric(df_win["수량"], errors="coerce").fillna(0)
     sales_agg = df_win.groupby("sku_en")["수량"].sum().reset_index().rename(columns={"수량":"최근판매합"})
@@ -473,6 +557,9 @@ def compute_replenishment_metrics(df_all_sales: pd.DataFrame, df_inv: pd.DataFra
         if c not in base.columns: base[c] = None
     out = base[cols].sort_values(["상태","커버일수"])
     return out
+
+# 공통 width 설정
+W = "stretch"
 
 # ----------------------
 # 5️⃣ 사이드바 메뉴
@@ -536,10 +623,10 @@ if menu == "거래 추가":
 elif menu == "경영 현황":
     st.header("📈 경영 현황 요약")
 
-    if Path(PIPELINE_IMG).exists():
-        st.image(PIPELINE_IMG, caption="ERP 파이프라인: 입고 → 재고 → 판매 → 발주 → 재입고")
+    if PIPELINE_IMG.exists():
+        st.image(str(PIPELINE_IMG), caption="ERP 파이프라인: 입고 → 재고 → 판매 → 발주 → 재입고")
     else:
-        st.caption("💡 PIPELINE 이미지 경로를 설정하면 구조도가 표시됩니다.")
+        st.caption("💡 assets/pipeline_diagram.png 를 넣으면 구조도가 표시됩니다.")
 
     total_rev = pd.to_numeric(df['수익'], errors='coerce').sum()
     total_tx = len(df)
@@ -563,11 +650,11 @@ elif menu == "경영 현황":
         with col4:
             cat = df.groupby('상품카테고리')['수익'].sum().reset_index()
             fig_cat = px.pie(cat, values='수익', names='상품카테고리', title="카테고리별 매출 비중")
-            st.plotly_chart(fig_cat, use_container_width=True)
+            st.plotly_chart(fig_cat, width=W)
         with col5:
             daily = df.groupby('날짜')['수익'].sum().reset_index()
             fig_trend = px.line(daily, x='날짜', y='수익', title="일자별 매출 추이")
-            st.plotly_chart(fig_trend, use_container_width=True)
+            st.plotly_chart(fig_trend, width=W)
 
 # ==============================================================
 # 💹 매출 대시보드
@@ -584,16 +671,16 @@ elif menu == "매출 대시보드":
 
         with col1:
             fig_month = px.bar(monthly, x='날짜', y='수익', title="월별 매출")
-            st.plotly_chart(fig_month, use_container_width=True)
+            st.plotly_chart(fig_month, width=W)
 
         with col2:
             cat_sales = df.groupby('상품카테고리')['수익'].sum().reset_index()
             fig_cat2 = px.bar(cat_sales, x='상품카테고리', y='수익', title="상품 카테고리별 매출")
-            st.plotly_chart(fig_cat2, use_container_width=True)
+            st.plotly_chart(fig_cat2, width=W)
 
         prod_sales = df.groupby(['상품타입','상품상세'])['수익'].sum().reset_index()
         fig_sun = px.sunburst(prod_sales, path=['상품타입','상품상세'], values='수익', title="상품 구조별 매출")
-        st.plotly_chart(fig_sun, use_container_width=True)
+        st.plotly_chart(fig_sun, width=W)
 
 # ==============================================================
 # 📅 기간별 분석
@@ -629,12 +716,12 @@ elif menu == "기간별 분석":
         colA, colB = st.columns(2)
         with colA:
             fig_w = px.bar(df_week, x='요일', y='수익', title="요일별 매출")
-            st.plotly_chart(fig_w, use_container_width=True)
+            st.plotly_chart(fig_w, width=W)
         with colB:
             fig_h = px.line(df_hour, x='시', y='수익', title="시간대별 매출")
-            st.plotly_chart(fig_h, use_container_width=True)
+            st.plotly_chart(fig_h, width=W)
         fig_m = px.bar(df_month, x='월', y='수익', title="월별 매출")
-        st.plotly_chart(fig_m, use_container_width=True)
+        st.plotly_chart(fig_m, width=W)
 
 # ==============================================================
 # 📦 재고 관리
@@ -656,14 +743,14 @@ elif menu == "재고 관리":
             title="상품별 재고 현황 (현재/초기)",
             color_continuous_scale='Blues'
         )
-        st.plotly_chart(fig_stock, use_container_width=True)
+        st.plotly_chart(fig_stock, width=W)
 
         show_cols = ['상품상세', '현재재고', '초기재고', '재고비율', '상태']
-        st.dataframe(df_inv[show_cols], use_container_width=True)
+        st.dataframe(df_inv[show_cols], width=W)
 
         if not low_stock.empty:
             st.warning("⚠️ 일부 상품의 재고가 15% 이하입니다. 자동 발주가 권장됩니다.")
-            st.dataframe(low_stock[show_cols], use_container_width=True)
+            st.dataframe(low_stock[show_cols], width=W)
             if st.button("🚚 자동 발주 생성"):
                 for _, row in low_stock.iterrows():
                     need_qty = int(row['초기재고'] - row['현재재고'])
@@ -710,7 +797,7 @@ elif menu == "재고 관리":
             "grams_per_cup": st.column_config.NumberColumn("레시피(g/잔)", min_value=0.0, step=0.5),
             "expiry_days": st.column_config.NumberColumn("유통기한(일)", min_value=1, step=1),
         },
-        use_container_width=True,
+        width=W,
         key="sku_params_editor"
     )
 
@@ -733,7 +820,7 @@ elif menu == "재고 관리":
     if df_metrics.empty:
         st.info("판매 데이터가 부족해 ROP 지표를 계산할 수 없습니다.")
     else:
-        st.dataframe(df_metrics, use_container_width=True)
+        st.dataframe(df_metrics, width=W)
 
         low_mask = df_metrics["상태"].eq("발주요망") | (df_metrics["권장발주"] > 0)
         df_need = df_metrics[low_mask]
@@ -741,7 +828,7 @@ elif menu == "재고 관리":
             st.warning("⚠️ 아래 항목은 ROP 이하이거나 권장발주량이 있습니다.")
             st.dataframe(
                 df_need[["상품상세","현재재고","ROP","권장발주","lead_time_days","safety_stock_units","target_days"]],
-                use_container_width=True
+                width=W
             )
 
             if st.button("🧾 권장 발주 일괄 생성"):
@@ -808,7 +895,7 @@ elif menu == "데이터 편집":
                     "단가": st.column_config.NumberColumn("단가(원)", step=100.0, min_value=0.0),
                     "수익": st.column_config.NumberColumn("수익(원)", step=100.0, min_value=0.0),
                 },
-                use_container_width=True,
+                width=W,
                 key="trx_edit_table"
             )
 
@@ -907,7 +994,7 @@ elif menu == "데이터 편집":
                     "초기재고": st.column_config.NumberColumn("초기재고", step=1, min_value=0),
                     "현재재고": st.column_config.NumberColumn("현재재고", step=1, min_value=0),
                 },
-                use_container_width=True,
+                width=W,
                 key="inv_edit_table"
             )
             if st.button("💾 재고 변경 저장"):
@@ -942,7 +1029,7 @@ elif menu == "거래 내역":
     else:
         cols = ['날짜','상품카테고리','상품타입','상품상세','수량','단가','수익','요일','시']
         cols = [c for c in cols if c in df.columns]
-        st.dataframe(df[cols].sort_values('날짜', ascending=False), use_container_width=True)
+        st.dataframe(df[cols].sort_values('날짜', ascending=False), width=W)
 
 # ==============================================================
 # ❓ 도움말
