@@ -40,13 +40,13 @@ def _resolve_path(val, default: Path) -> Path:
     p = Path(str(val))
     return p if p.is_absolute() else (BASE_DIR / p)
 
-DATA_DIR   = _resolve_path(SECRETS.get("DATA_DIR")   or os.environ.get("ERP_DATA_DIR"),   BASE_DIR / "data")
-ASSETS_DIR = _resolve_path(SECRETS.get("ASSETS_DIR") or os.environ.get("ERP_ASSETS_DIR"), BASE_DIR / "assets")
-KEYS_DIR   = _resolve_path(SECRETS.get("KEYS_DIR")   or os.environ.get("ERP_KEYS_DIR"),   BASE_DIR / "keys")
+DATA_DIR   = Path("/Users/iseojin/Desktop/google-erp-app/data")
+ASSETS_DIR = Path("/Users/iseojin/Desktop/google-erp-app/keys")
+KEYS_DIR   = Path("/Users/iseojin/Desktop/google-erp-app")
 
 CSV_PATH     = DATA_DIR / "Coffee Shop Sales.csv"
 PIPELINE_IMG = ASSETS_DIR / "pipeline_diagram.png"
-SA_FILE_PATH = KEYS_DIR / "serviceAccount.json"
+SA_FILE_PATH = KEYS_DIR / "serviceAccountKey.json"
 
 SALES_COLLECTION      = "coffee_sales"
 INVENTORY_COLLECTION  = "inventory"
@@ -650,11 +650,11 @@ elif menu == "경영 현황":
         with col4:
             cat = df.groupby('상품카테고리')['수익'].sum().reset_index()
             fig_cat = px.pie(cat, values='수익', names='상품카테고리', title="카테고리별 매출 비중")
-            st.plotly_chart(fig_cat, width=W)
+            st.plotly_chart(fig_cat, use_container_width=True)
         with col5:
             daily = df.groupby('날짜')['수익'].sum().reset_index()
             fig_trend = px.line(daily, x='날짜', y='수익', title="일자별 매출 추이")
-            st.plotly_chart(fig_trend, width=W)
+            st.plotly_chart(fig_trend, use_container_width=True)
 
 # ==============================================================
 # 💹 매출 대시보드
@@ -671,16 +671,16 @@ elif menu == "매출 대시보드":
 
         with col1:
             fig_month = px.bar(monthly, x='날짜', y='수익', title="월별 매출")
-            st.plotly_chart(fig_month, width=W)
+            st.plotly_chart(fig_month, use_container_width=True)
 
         with col2:
             cat_sales = df.groupby('상품카테고리')['수익'].sum().reset_index()
             fig_cat2 = px.bar(cat_sales, x='상품카테고리', y='수익', title="상품 카테고리별 매출")
-            st.plotly_chart(fig_cat2, width=W)
+            st.plotly_chart(fig_cat2, use_container_width=True)
 
         prod_sales = df.groupby(['상품타입','상품상세'])['수익'].sum().reset_index()
         fig_sun = px.sunburst(prod_sales, path=['상품타입','상품상세'], values='수익', title="상품 구조별 매출")
-        st.plotly_chart(fig_sun, width=W)
+        st.plotly_chart(fig_sun, use_container_width=True)
 
 # ==============================================================
 # 📅 기간별 분석
@@ -716,12 +716,12 @@ elif menu == "기간별 분석":
         colA, colB = st.columns(2)
         with colA:
             fig_w = px.bar(df_week, x='요일', y='수익', title="요일별 매출")
-            st.plotly_chart(fig_w, width=W)
+            st.plotly_chart(fig_w, use_container_width=True)
         with colB:
             fig_h = px.line(df_hour, x='시', y='수익', title="시간대별 매출")
-            st.plotly_chart(fig_h, width=W)
+            st.plotly_chart(fig_h, use_container_width=True)
         fig_m = px.bar(df_month, x='월', y='수익', title="월별 매출")
-        st.plotly_chart(fig_m, width=W)
+        st.plotly_chart(fig_m, use_container_width=True)
 
 # ==============================================================
 # 📦 재고 관리
@@ -743,7 +743,7 @@ elif menu == "재고 관리":
             title="상품별 재고 현황 (현재/초기)",
             color_continuous_scale='Blues'
         )
-        st.plotly_chart(fig_stock, width=W)
+        st.plotly_chart(fig_stock, config={"responsive": True})
 
         show_cols = ['상품상세', '현재재고', '초기재고', '재고비율', '상태']
         st.dataframe(df_inv[show_cols], width=W)
