@@ -67,7 +67,7 @@ STOCK_MOVES_COLLECTION  = "stock_moves"    # 재고 이동 로그: 판매/시뮬
 USE_KRW_CONVERSION = False   # CSV가 USD면 True로
 KRW_PER_USD = 1350
 
-DEFAULT_INITIAL_STOCK   = 100
+DEFAULT_INITIAL_STOCK   = 10000
 REORDER_THRESHOLD_RATIO = 0.15  # 15%
 
 # 디렉토리 준비
@@ -746,16 +746,15 @@ def log_stock_move(menu_sku_en: str, qty: int, details: list[dict], move_type: s
     except Exception:
         # 로깅 실패는 앱 동작에 영향 주지 않음
         pass
-
-    for it in items:
-        ing  = it["ingredient_en"]
-        uom  = it["uom"]
-        base = safe_float(it["qty"])
-        w    = safe_float(it["waste_pct"]) / 100.0
-        need = sold_qty * base * (1.0 + w)
-        b, a, inv_uom = deduct_inventory(ing, need, uom=uom)
-        summary.append({"ingredient_en": ing, "used": need, "uom": inv_uom, "before": b, "after": a})
-    return 
+def adjust_inventory_by_recipe(menu_sku_en: str, diff_qty: int, move_type: str, note: str = "") -> None:
+    """
+    수량 증감(diff_qty)에 따라 레시피 기반으로 재고를 증/차감.
+    diff_qty > 0 → 추가 차감(판매 증가), diff_qty < 0 → 복원(판매 감소/삭제)
+    """
+    if diff_qty == 0:
+        return
+    ded_summary = apply_recipe_deduction(menu_sku_en, int(diff_qty), commit=True)
+    log_stock_move(menu_sku_en, int(diff_qty), ded_summary, move_type=move_type, note=note)
 
 # ---------- SKU 파라미터 로더 (단일 정의; 메뉴 분기 시작 전) ----------
 def load_sku_params_df() -> pd.DataFrame:
@@ -1079,6 +1078,27 @@ elif menu == "재고 관리":
 
     st.header("📦 재고 관리 현황")
 
+    # ===== 재고 초기화 =====
+    with st.expander("🧹 재고 데이터 초기화 기능"):
+        st.warning("⚠️ 모든 재고의 '초기재고'와 '현재재고'를 기본값(10000)으로 되돌립니다. 복구 불가하니 주의하세요.")
+        if st.button("재고 데이터 초기화 실행", type="primary"):
+            try:
+                inv_docs = db.collection(INVENTORY_COLLECTION).stream()
+                count = 0
+                for d in inv_docs:
+                    ref = db.collection(INVENTORY_COLLECTION).document(d.id)
+                    ref.update({
+                        "초기재고": DEFAULT_INITIAL_STOCK,
+                        "현재재고": DEFAULT_INITIAL_STOCK
+                    })
+                    count += 1
+                st.success(f"✅ 총 {count}개의 재고 문서를 기본값({DEFAULT_INITIAL_STOCK})으로 초기화했습니다.")
+                st.balloons()
+                safe_rerun()
+            except Exception as e:
+                st.error(f"초기화 중 오류 발생: {e}")
+
+
     # ===== 재료(Ingredient) 뷰 =====
     df_inv = load_inventory_df()
     if df_inv.empty:
@@ -1103,12 +1123,12 @@ elif menu == "재고 관리":
             st.dataframe(df_ing[['상품상세','현재재고','초기재고','uom','재고비율','상태']], width=W)
 
             if not low_ing.empty:
-                st.warning("⚠️ 일부 재료 재고가 15% 이하입니다. 자동 발주를 고려하세요.")
+                st.warning("⚠️ 일부 재료 재고가 15% 이하입니다. 발주를 고려하세요.")
 
     st.markdown("---")
 
     # ===== 라떼 연결 마법사 =====
-    with st.expander("🔗 라떼 연결 마법사 (한 메뉴 POC)"):
+    with st.expander("🔗 라떼 연결(한 메뉴 POC)"):
         st.caption("라떼 1잔 = Espresso Roast 18g + Milk 300ml + Regular syrup 5ml (+Milk waste 5%)")
         if st.button("라떼 레시피 생성/덮어쓰기"):
             latte_items = [
@@ -1286,12 +1306,8 @@ elif menu == "데이터 편집":
 
                     if patch:
                         if reflect_inv and '수량' in patch:
-                            qty_old = int(orig.get('수량', 0))
-                            delta = qty_old - qty_new  # +면 재고 복원, -면 추가 차감
-                            ref = ensure_inventory_doc(detail_en)
-                            snap = ref.get()
-                            cur = safe_float(snap.to_dict().get("현재재고", DEFAULT_INITIAL_STOCK))
-                            ref.update({"현재재고": cur + delta})
+                            diff = qty_new - int(orig.get('수량', 0))
+                            adjust_inventory_by_recipe(detail_en, diff, move_type="edit_adjust", note=str(doc_id))
 
                         db.collection(SALES_COLLECTION).document(doc_id).update(patch)
                         changed += 1
@@ -1313,10 +1329,7 @@ elif menu == "데이터 편집":
                 for did in del_ids:
                     raw = df_raw[df_raw['_id'] == did].iloc[0].to_dict()
                     if restore_inv_on_delete:
-                        ref = ensure_inventory_doc(raw.get('상품상세'))
-                        snap = ref.get()
-                        cur = safe_float(snap.to_dict().get("현재재고", DEFAULT_INITIAL_STOCK))
-                        ref.update({"현재재고": cur + int(raw.get('수량', 0))})
+                        adjust_inventory_by_recipe(raw.get('상품상세'), -int(raw.get('수량', 0)), move_type="delete_restore", note=str(did))
                     db.collection(SALES_COLLECTION).document(did).delete()
                 st.success(f"✅ {len(del_ids)}건 삭제 완료")
                 safe_rerun()
