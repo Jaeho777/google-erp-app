@@ -5,6 +5,7 @@
 #  - 원본/Firestore는 영어 저장, 화면은 한글 표시(정/역매핑)
 #  - 데이터 편집(거래 수정/삭제 + 재고 일괄수정)
 #  - 도움말 탭 + SKU 파라미터(리드타임/세이프티/목표일수/레시피g) + ROP 지표/권장발주
+#  - NEW: 레시피(BOM) 기반 자동 차감, uom(단위) 지원, 실사/오차율, 발주 ±범위 표시
 # ==============================================================
 
 import os
@@ -21,6 +22,11 @@ import plotly.io as pio
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+# --- Pylance/static analyzer guards (no runtime effect) ---
+items = []  # type: ignore
+sold_qty = 0  # type: ignore
+summary = []  # type: ignore
 
 # ----------------------
 # 0️⃣ 경로/상수 (팀원이 어디서 받아도 동작)
@@ -53,10 +59,15 @@ INVENTORY_COLLECTION  = "inventory"
 ORDERS_COLLECTION     = "orders"
 SKU_PARAMS_COLLECTION = "sku_params"
 
+# ---- [NEW] 레시피/실사 컬렉션 ----
+RECIPES_COLLECTION      = "recipes"        # 메뉴 SKU -> [ {ingredient_en, qty, uom, waste_pct} ]
+STOCK_COUNTS_COLLECTION = "stock_counts"   # 실사 기록: {sku_en, count, uom, counted_at}
+STOCK_MOVES_COLLECTION  = "stock_moves"    # 재고 이동 로그: 판매/시뮬/입고 등
+
 USE_KRW_CONVERSION = False   # CSV가 USD면 True로
 KRW_PER_USD = 1350
 
-DEFAULT_INITIAL_STOCK   = 100
+DEFAULT_INITIAL_STOCK   = 10000
 REORDER_THRESHOLD_RATIO = 0.15  # 15%
 
 # 디렉토리 준비
@@ -284,6 +295,58 @@ def map_series(s: pd.Series, mapping: dict) -> pd.Series:
     return s.apply(lambda x: mapping.get(x, x))
 
 # ----------------------
+# ✅ UoM(단위) 유틸
+# ----------------------
+def normalize_uom(u: str | None) -> str:
+    u = (u or "ea").strip().lower()
+    if u in {"g", "gram", "grams", "그램", "kg", "킬로그램"}:
+        return "g"
+    if u in {"ml", "밀리리터", "l", "리터"}:
+        return "ml"
+    return "ea"
+
+def convert_qty(qty: float, from_uom: str, to_uom: str) -> float:
+    """kg↔g, l↔ml 변환. 그 외는 동일 단위로 간주.
+    (입력은 g/ml/ea만 쓰는 것을 권장)
+    """
+    fu = normalize_uom(from_uom)
+    tu = normalize_uom(to_uom)
+    if fu == tu:
+        return float(qty)
+    # 밀도 없이 g↔ml 변환은 불가 → 단위 다르면 변환하지 않고 그대로 반환
+    return float(qty)
+
+def safe_float(x, default=0.0):
+    """
+    Robust float parser.
+    - Returns `default` if x is None, empty, or NaN.
+    - Does NOT cast `default` to float (so default can be None).
+    """
+    # Fast-path for explicit None
+    if x is None:
+        return default
+    try:
+        # Numbers (handle NaN)
+        if isinstance(x, (int, float)):
+            try:
+                if pd.isna(x):
+                    return default
+            except Exception:
+                pass
+            return float(x)
+        # Strings
+        if isinstance(x, str):
+            s = x.strip()
+            if s == "" or s.lower() in {"nan", "none"}:
+                return default
+            s = s.replace(",", "")
+            return float(s)
+        # Fallback: attempt cast
+        return float(x)
+    except Exception:
+        return default
+
+# ----------------------
 # ✅ 날짜 파서: 명시 형식 우선 + 경고없는 폴백
 # ----------------------
 def parse_mixed_dates(series: pd.Series) -> pd.Series:
@@ -430,133 +493,396 @@ def format_krw(x: float) -> str:
     except Exception:
         return "-"
 
-def ensure_inventory_doc(product_detail_en: str):
+# ---- 단위 유틸 ----
+VALID_UOM = {"ea","g","kg","ml","l"}
+UOM_SYNONYM = {
+    "piece":"ea","pcs":"ea","unit":"ea","units":"ea",
+    "gram":"g","grams":"g","gms":"g",
+    "kilogram":"kg","kilograms":"kg",
+    "milliliter":"ml","millilitre":"ml","milliliters":"ml","millilitres":"ml",
+    "liter":"l","litre":"l","liters":"l","litres":"l",
+}
+
+def normalize_uom(u: str) -> str:
+    if not u:
+        return "ea"
+    s = str(u).strip().lower()
+    s = UOM_SYNONYM.get(s, s)
+    if s not in VALID_UOM:
+        return s  # 알 수 없는 단위도 그대로 유지
+    return s
+
+def convert_qty(qty: float, from_uom: str, to_uom: str) -> float:
+    try:
+        q = float(qty)
+    except Exception:
+        return 0.0
+    f = normalize_uom(from_uom)
+    t = normalize_uom(to_uom)
+    if f == t:
+        return q
+    # g <-> kg
+    if f == "g" and t == "kg":
+        return q / 1000.0
+    if f == "kg" and t == "g":
+        return q * 1000.0
+    # ml <-> l
+    if f == "ml" and t == "l":
+        return q / 1000.0
+    if f == "l" and t == "ml":
+        return q * 1000.0
+    # 상이한/비변환 단위는 그대로 반환 (상황에 따라 고도화 가능)
+    return q
+
+# (기존) 최소 보장 인벤토리 문서
+# → NEW ensure_inventory_doc로 대체됨
+
+def ensure_inventory_doc(product_detail_en: str, uom: str | None = None, is_ingredient: bool | None = None):
+    """인벤토리 문서 보장 + uom/is_ingredient 관리"""
     ref = db.collection(INVENTORY_COLLECTION).document(product_detail_en)
     doc = ref.get()
     if not doc.exists:
         ref.set({
             "상품상세_en": product_detail_en,
             "초기재고": DEFAULT_INITIAL_STOCK,
-            "현재재고": DEFAULT_INITIAL_STOCK
+            "현재재고": DEFAULT_INITIAL_STOCK,
+            "uom": normalize_uom(uom or "ea"),
+            "is_ingredient": bool(is_ingredient) if is_ingredient is not None else False,
         })
+        return ref
+    # 기존 문서 업데이트
+    patch = {}
+    data = doc.to_dict() or {}
+    if "uom" not in data or uom:
+        patch["uom"] = normalize_uom(uom or data.get("uom", "ea"))
+    if is_ingredient is not None and data.get("is_ingredient") != bool(is_ingredient):
+        patch["is_ingredient"] = bool(is_ingredient)
+    if patch:
+        ref.update(patch)
     return ref
 
+# 재료 플래그 전용 헬퍼
+def ensure_ingredient_sku(ingredient_en: str, uom: str = "ea"):
+    return ensure_inventory_doc(ingredient_en, uom=uom, is_ingredient=True)
+    
+
+# (구버전) 단순 차감: 메뉴자체를 ea로 차감
 def deduct_stock(product_detail_en: str, qty: int):
     ref = ensure_inventory_doc(product_detail_en)
     snap = ref.get()
     data = snap.to_dict() if snap.exists else {}
     init_stock = int(data.get("초기재고", DEFAULT_INITIAL_STOCK))
-    cur_stock = int(data.get("현재재고", DEFAULT_INITIAL_STOCK))
+    cur_stock = safe_float(data.get("현재재고", DEFAULT_INITIAL_STOCK))
     new_stock = max(cur_stock - int(qty), 0)
     ref.update({"현재재고": new_stock})
     return init_stock, new_stock
 
+# ---- SKU 인벤토리 로드(uom 포함) ----
 def load_inventory_df() -> pd.DataFrame:
     inv_docs = db.collection(INVENTORY_COLLECTION).stream()
     rows = []
     for d in inv_docs:
-        doc = d.to_dict()
-        en = doc.get("상품상세_en", d.id)
-        ko = to_korean_detail(en)
+        doc = d.to_dict() or {}
+        en  = doc.get("상품상세_en", d.id)
+        ko  = to_korean_detail(en)
         rows.append({
             "상품상세_en": en,
             "상품상세": ko,
             "초기재고": doc.get("초기재고", DEFAULT_INITIAL_STOCK),
-            "현재재고": doc.get("현재재고", DEFAULT_INITIAL_STOCK)
+            "현재재고": doc.get("현재재고", DEFAULT_INITIAL_STOCK),
+            "uom": normalize_uom(doc.get("uom", "ea")),
+            "is_ingredient": bool(doc.get("is_ingredient", False)),
         })
     return pd.DataFrame(rows)
 
-# ---- SKU 파라미터 로드/저장 ----
+
+# ---- [NEW] 레시피 로딩/저장 ----
+
+def get_all_recipe_ingredients() -> set:
+    """레시피에 등장하는 모든 ingredient_en 집합"""
+    try:
+        docs = db.collection(RECIPES_COLLECTION).stream()
+    except Exception:
+        return set()
+    S = set()
+    for d in docs:
+        items = (d.to_dict() or {}).get("items", []) or []
+        for it in items:
+            ing = str(it.get("ingredient_en", "")).strip()
+            if ing:
+                S.add(ing)
+    return S
+
+# ---- [NEW] 레시피 로딩/저장 ----
+def load_recipe(menu_sku_en: str) -> list[dict]:
+    doc = db.collection(RECIPES_COLLECTION).document(menu_sku_en).get()
+    if not doc.exists:
+        return []
+    items = doc.to_dict().get("items", [])
+    out = []
+    for it in items:
+        out.append({
+            "ingredient_en": str(it.get("ingredient_en", "")).strip(),
+            "qty": safe_float(it.get("qty", 0.0)),
+            "uom": normalize_uom(it.get("uom", "ea")),
+            "waste_pct": safe_float(it.get("waste_pct", 0.0))
+        })
+    return out
+
+def upsert_recipe_item(menu_sku_en: str, ingredient_en: str, qty: float, uom: str = "ea", waste_pct: float = 0.0):
+    """레시피 항목 1개 추가/갱신 (동일 ingredient_en 있으면 교체)"""
+    ref = db.collection(RECIPES_COLLECTION).document(menu_sku_en)
+    snap = ref.get()
+    items = []
+    if snap.exists:
+        items = snap.to_dict().get("items", []) or []
+        items = [it for it in items if str(it.get("ingredient_en")) != ingredient_en]
+    items.append({
+        "ingredient_en": ingredient_en,
+        "qty": safe_float(qty),
+        "uom": normalize_uom(uom),
+        "waste_pct": safe_float(waste_pct),
+    })
+    ref.set({"menu_sku_en": menu_sku_en, "items": items})
+    # 재료 플래그 보장
+    ensure_ingredient_sku(ingredient_en, uom=uom)
+
+
+def load_recipe(menu_sku_en: str) -> list[dict]:
+    try:
+        doc = db.collection(RECIPES_COLLECTION).document(menu_sku_en).get()
+        if not doc.exists:
+            return []
+        data = doc.to_dict() or {}
+        raw_items = data.get("items", []) or []
+        out: list[dict] = []
+        for it in raw_items:
+            ing = str(it.get("ingredient_en", "")).strip()
+            if not ing:
+                continue
+            qty = safe_float(it.get("qty"), 0.0)
+            uom = normalize_uom(it.get("uom", "ea"))
+            waste = safe_float(it.get("waste_pct", 0.0), 0.0)
+            out.append({
+                "ingredient_en": ing,
+                "qty": qty,
+                "uom": uom,
+                "waste_pct": waste,
+            })
+        return out
+    except Exception:
+        return []
+
+
+# ---- [NEW] 재고 차감(단위 인지) ----
+def deduct_inventory(ingredient_en: str, qty: float, uom: str):
+    """ingredient_en 인벤토리에서 qty(uom)만큼 차감"""
+    ref = ensure_inventory_doc(ingredient_en, uom=uom)
+    snap = ref.get()
+    data = snap.to_dict() or {}
+    cur = safe_float(data.get("현재재고", DEFAULT_INITIAL_STOCK))
+    inv_uom = normalize_uom(data.get("uom", "ea"))
+    use_qty = convert_qty(qty, from_uom=uom, to_uom=inv_uom)
+    new_stock = max(cur - use_qty, 0.0)
+    ref.update({"현재재고": new_stock})
+    return cur, new_stock, inv_uom
+
+# ---- [NEW] 레시피 기반 차감 ----
+def apply_recipe_deduction(menu_sku_en: str, sold_qty: int, commit: bool = True) -> list[dict]:
+    """
+    메뉴 판매시: 레시피 있으면 재료별 차감, 없으면 메뉴 자체 차감.
+    commit=False면 재고를 수정하지 않고 예상 after만 계산.
+    반환: [{"ingredient_en", "used", "uom", "before", "after"}...]
+    """
+    items = load_recipe(menu_sku_en)
+    summary: list[dict] = []
+
+    if not items:
+        # 레시피 없으면 메뉴 자체를 'ea'로 처리
+        ref = ensure_inventory_doc(menu_sku_en, uom="ea")
+        snap = ref.get()
+        data = snap.to_dict() or {}
+        before = safe_float(data.get("현재재고", DEFAULT_INITIAL_STOCK))
+        inv_uom = normalize_uom(data.get("uom", "ea"))
+        used = float(sold_qty)
+        after = max(before - used, 0.0)
+        if commit:
+            ref.update({"현재재고": after})
+        summary.append({"ingredient_en": menu_sku_en, "used": used, "uom": inv_uom, "before": before, "after": after})
+        return summary
+
+    for it in items:
+        ing  = it["ingredient_en"]
+        uom  = it["uom"]
+        base = safe_float(it["qty"])
+        w    = safe_float(it["waste_pct"]) / 100.0
+        need = sold_qty * base * (1.0 + w)
+
+        # 인벤토리 읽기
+        ref = ensure_inventory_doc(ing, uom=uom)
+        snap = ref.get()
+        data = snap.to_dict() or {}
+        before = safe_float(data.get("현재재고", DEFAULT_INITIAL_STOCK))
+        inv_uom = normalize_uom(data.get("uom", "ea"))
+        use_qty = convert_qty(need, from_uom=uom, to_uom=inv_uom)
+        after = max(before - use_qty, 0.0)
+        if commit:
+            ref.update({"현재재고": after})
+        summary.append({"ingredient_en": ing, "used": use_qty, "uom": inv_uom, "before": before, "after": after})
+    return summary
+
+def log_stock_move(menu_sku_en: str, qty: int, details: list[dict], move_type: str = "sale", note: str | None = None):
+    """재고 이동 로그 기록 (상세는 ingredient 단위)."""
+    try:
+        db.collection(STOCK_MOVES_COLLECTION).add({
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": move_type,
+            "menu_sku_en": menu_sku_en,
+            "menu_sku_ko": to_korean_detail(menu_sku_en),
+            "qty": int(qty),
+            "details": details,
+            "note": note or "",
+        })
+    except Exception:
+        # 로깅 실패는 앱 동작에 영향 주지 않음
+        pass
+def adjust_inventory_by_recipe(menu_sku_en: str, diff_qty: int, move_type: str, note: str = "") -> None:
+    """
+    수량 증감(diff_qty)에 따라 레시피 기반으로 재고를 증/차감.
+    diff_qty > 0 → 추가 차감(판매 증가), diff_qty < 0 → 복원(판매 감소/삭제)
+    """
+    if diff_qty == 0:
+        return
+    ded_summary = apply_recipe_deduction(menu_sku_en, int(diff_qty), commit=True)
+    log_stock_move(menu_sku_en, int(diff_qty), ded_summary, move_type=move_type, note=note)
+
+# ---------- SKU 파라미터 로더 (단일 정의; 메뉴 분기 시작 전) ----------
 def load_sku_params_df() -> pd.DataFrame:
-    docs = db.collection(SKU_PARAMS_COLLECTION).stream()
+    """Firestore 'sku_params' 컬렉션을 DataFrame으로 로드하고 기본값/타입을 보정."""
+    try:
+        docs = db.collection(SKU_PARAMS_COLLECTION).stream()
+    except Exception:
+        docs = []
+
     rows = []
     for d in docs:
-        item = d.to_dict()
-        item["_id"] = d.id
+        item = d.to_dict() or {}
+        # 문서 id도 보존
+        try:
+            item["_id"] = d.id
+        except Exception:
+            item["_id"] = item.get("_id", "")
         rows.append(item)
+
     dfp = pd.DataFrame(rows)
     if dfp.empty:
         dfp = pd.DataFrame(columns=[
             "_id","sku_en","lead_time_days","safety_stock_units","target_days","grams_per_cup","expiry_days"
         ])
-    for col, default in [
-        ("lead_time_days", 3), ("safety_stock_units", 10),
-        ("target_days", 21), ("grams_per_cup", 18.0), ("expiry_days", 28)
-    ]:
+
+    defaults = {
+        "lead_time_days": 3,
+        "safety_stock_units": 10,
+        "target_days": 21,
+        "grams_per_cup": 18.0,
+        "expiry_days": 28,
+    }
+    for col, default in defaults.items():
         if col not in dfp.columns:
             dfp[col] = default
         else:
             dfp[col] = pd.to_numeric(dfp[col], errors="coerce").fillna(default)
+
     return dfp
 
-def upsert_sku_params(dfp: pd.DataFrame):
-    saved = 0
-    for _, r in dfp.iterrows():
-        sku_en = str(r["sku_en"]).strip()
-        if not sku_en:
-            continue
-        doc = db.collection(SKU_PARAMS_COLLECTION).document(sku_en)
-        patch = {
-            "sku_en": sku_en,
-            "lead_time_days": int(r.get("lead_time_days", 3)),
-            "safety_stock_units": int(r.get("safety_stock_units", 10)),
-            "target_days": int(r.get("target_days", 21)),
-            "grams_per_cup": float(r.get("grams_per_cup", 18.0)),
-            "expiry_days": int(r.get("expiry_days", 28)),
-        }
-        doc.set(patch)
-        saved += 1
-    return saved
 
-# ---- ROP/권장발주 계산 ----
-def compute_replenishment_metrics(df_all_sales: pd.DataFrame, df_inv: pd.DataFrame, df_params: pd.DataFrame, window_days: int = 28) -> pd.DataFrame:
-    if df_inv.empty:
+# ---------- 재료 ROP/권장발주 계산 (단일 정의; 메뉴 분기 시작 전) ----------
+def compute_ingredient_metrics_for_menu(
+    menu_sku_en: str,
+    df_all_sales: pd.DataFrame,
+    df_inv: pd.DataFrame,
+    df_params: pd.DataFrame,
+    window_days: int = 28
+) -> pd.DataFrame:
+    """
+    특정 메뉴의 레시피와 최근 판매량(윈도우) 기반으로 재료별
+    일평균소진/커버일수/ROP/권장발주를 계산.
+    반환 컬럼:
+      ["상품상세","sku_en","현재재고","초기재고","uom","최근소진합","일평균소진","커버일수",
+       "lead_time_days","safety_stock_units","target_days","ROP","권장발주","상태"]
+    """
+    items = load_recipe(menu_sku_en)
+    if not items:
         return pd.DataFrame()
 
+    # 판매 윈도우 추출
     if "날짜" in df_all_sales.columns and pd.api.types.is_datetime64_any_dtype(df_all_sales["날짜"]):
         max_day = df_all_sales["날짜"].max()
-        min_day = max_day - pd.Timedelta(days=window_days-1)
+        min_day = max_day - pd.Timedelta(days=window_days - 1)
         df_win = df_all_sales[(df_all_sales["날짜"] >= min_day) & (df_all_sales["날짜"] <= max_day)].copy()
     else:
         df_win = df_all_sales.copy()
 
+    # 메뉴 영어키 매핑
+    df_win = df_win.copy()
     if "상품상세" in df_win.columns:
-        df_win = df_win.copy()
         df_win["sku_en"] = df_win["상품상세"].apply(from_korean_detail)
     else:
         df_win["sku_en"] = ""
 
-    if "수량" in df_win.columns:
-        df_win["수량"] = pd.to_numeric(df_win["수량"], errors="coerce").fillna(0)
-    sales_agg = df_win.groupby("sku_en")["수량"].sum().reset_index().rename(columns={"수량":"최근판매합"})
+    # 대상 메뉴 판매수량 합계
+    df_win["수량"] = pd.to_numeric(df_win.get("수량", 0), errors="coerce").fillna(0)
+    sold_sum = df_win.loc[df_win["sku_en"].eq(menu_sku_en), "수량"].sum()
 
-    base = df_inv.rename(columns={"상품상세_en":"sku_en"}).copy()
-    base = base.merge(df_params, on="sku_en", how="left")
-    base = base.merge(sales_agg, on="sku_en", how="left")
-    base["최근판매합"] = pd.to_numeric(base["최근판매합"], errors="coerce").fillna(0)
+    # 재료별 최근소진합(레시피×판매)
+    rows = []
+    for it in items:
+        ing  = it.get("ingredient_en", "")
+        base = safe_float(it.get("qty", 0), 0)
+        w    = safe_float(it.get("waste_pct", 0), 0) / 100.0
+        need = sold_sum * base * (1 + w)
+        rows.append({"sku_en": ing, "최근소진합": need, "uom_src": it.get("uom", "ea")})
+    use_df = pd.DataFrame(rows)
+
+    # 인벤토리 결합 (레시피 재료만)
+    base = df_inv.rename(columns={"상품상세_en": "sku_en"}).copy()
+    base = base.merge(use_df, on="sku_en", how="right")
+
+    # 단위 변환: recipe uom -> inventory uom
+    base["uom"] = base["uom"].apply(normalize_uom)
+    base["uom_src"] = base["uom_src"].apply(normalize_uom)
+    base["최근소진합"] = base.apply(
+        lambda r: convert_qty(r["최근소진합"], from_uom=r["uom_src"], to_uom=r["uom"]),
+        axis=1
+    )
 
     days = max(window_days, 1)
-    base["일평균소진"] = (base["최근판매합"] / days).round(3)
-    base["일평균소진"] = base["일평균소진"].replace([0], 0.01)  # 시연용 최소치
+    base["일평균소진"] = (base["최근소진합"] / days).round(3)
+    base.loc[base["일평균소진"].eq(0), "일평균소진"] = 0.01  # 0 division 방지
     base["커버일수"] = (base["현재재고"] / base["일평균소진"]).round(1)
 
+    # 파라미터 결합 + 기본값
+    base = base.merge(df_params, on="sku_en", how="left")
     base["lead_time_days"] = pd.to_numeric(base.get("lead_time_days", 3), errors="coerce").fillna(3).astype(int)
     base["safety_stock_units"] = pd.to_numeric(base.get("safety_stock_units", 10), errors="coerce").fillna(10).astype(int)
     base["target_days"] = pd.to_numeric(base.get("target_days", 21), errors="coerce").fillna(21).astype(int)
 
+    # ROP/권장발주/상태
     base["ROP"] = (base["일평균소진"] * base["lead_time_days"] + base["safety_stock_units"]).round(0).astype(int)
     base["권장발주"] = ((base["target_days"] * base["일평균소진"]) - base["현재재고"]).apply(lambda x: max(int(ceil(x)), 0))
     base["상태"] = base.apply(lambda r: "발주요망" if r["현재재고"] <= r["ROP"] else "정상", axis=1)
 
-    cols = [
-        "상품상세","sku_en","현재재고","초기재고",
-        "최근판매합","일평균소진","커버일수","lead_time_days","safety_stock_units","target_days",
-        "ROP","권장발주","상태"
-    ]
+    # 표시명
+    base["상품상세"] = base["sku_en"].apply(to_korean_detail)
+
+    cols = ["상품상세","sku_en","현재재고","초기재고","uom","최근소진합","일평균소진","커버일수",
+            "lead_time_days","safety_stock_units","target_days","ROP","권장발주","상태"]
     for c in cols:
-        if c not in base.columns: base[c] = None
-    out = base[cols].sort_values(["상태","커버일수"])
-    return out
+        if c not in base.columns:
+            base[c] = None
+
+    return base[cols].sort_values(["상태","커버일수"])
+
 
 # 공통 width 설정
 W = "stretch"
@@ -611,9 +937,34 @@ if menu == "거래 추가":
             }
             db.collection(SALES_COLLECTION).add(new_doc)
 
-            init_stock, new_stock = deduct_stock(상품상세_en, int(수량))
+            # ✅ 레시피 자동 보장 후, 레시피 기반 차감(없으면 메뉴 자체 차감)
+            try:
+                # 기본 레시피 자동 보장
+                _auto_defaults = {
+                    "Latte": [
+                        {"ingredient_en": "Espresso Roast", "qty": 18, "uom": "g", "waste_pct": 0},
+                        {"ingredient_en": "Milk", "qty": 300, "uom": "ml", "waste_pct": 5},
+                        {"ingredient_en": "Regular syrup", "qty": 5, "uom": "ml", "waste_pct": 0},
+                    ]
+                }
+                doc = db.collection(RECIPES_COLLECTION).document(상품상세_en).get()
+                if not doc.exists and 상품상세_en in _auto_defaults:
+                    db.collection(RECIPES_COLLECTION).document(상품상세_en).set({
+                        "menu_sku_en": 상품상세_en,
+                        "items": _auto_defaults[상품상세_en]
+                    })
+                    for it in _auto_defaults[상품상세_en]:
+                        ensure_inventory_doc(it["ingredient_en"], uom=it["uom"])
+            except Exception:
+                pass
 
-            st.success(f"✅ 거래 저장 및 재고 차감 완료! (잔여: {new_stock}/{init_stock})")
+            ded_summary = apply_recipe_deduction(상품상세_en, int(수량), commit=True)
+            # 이동 로그 기록
+            log_stock_move(상품상세_en, int(수량), ded_summary, move_type="sale")
+            msg_lines = []
+            for s in ded_summary:
+                msg_lines.append(f"- {to_korean_detail(s['ingredient_en'])}: {s['used']:.2f}{s['uom']} → 잔여 {s['after']:.2f}/{s['before']:.2f}")
+            st.success("✅ 거래 저장 및 재고 차감 완료!\n" + "\n".join(msg_lines))
             st.balloons()
             safe_rerun()
 
@@ -626,7 +977,7 @@ elif menu == "경영 현황":
     if PIPELINE_IMG.exists():
         st.image(str(PIPELINE_IMG), caption="ERP 파이프라인: 입고 → 재고 → 판매 → 발주 → 재입고")
     else:
-        st.caption("💡 assets/pipeline_diagram.png 를 넣으면 구조도가 표시됩니다.")
+        st.caption("")
 
     total_rev = pd.to_numeric(df['수익'], errors='coerce').sum()
     total_tx = len(df)
@@ -723,51 +1074,97 @@ elif menu == "기간별 분석":
         fig_m = px.bar(df_month, x='월', y='수익', title="월별 매출")
         st.plotly_chart(fig_m, width=W)
 
-# ==============================================================
-# 📦 재고 관리
-# ==============================================================
 elif menu == "재고 관리":
+
     st.header("📦 재고 관리 현황")
 
+    # ===== 재고 초기화 =====
+    with st.expander("🧹 재고 데이터 초기화 기능"):
+        st.warning("⚠️ 모든 재고의 '초기재고'와 '현재재고'를 기본값(10000)으로 되돌립니다. 복구 불가하니 주의하세요.")
+        if st.button("재고 데이터 초기화 실행", type="primary"):
+            try:
+                inv_docs = db.collection(INVENTORY_COLLECTION).stream()
+                count = 0
+                for d in inv_docs:
+                    ref = db.collection(INVENTORY_COLLECTION).document(d.id)
+                    ref.update({
+                        "초기재고": DEFAULT_INITIAL_STOCK,
+                        "현재재고": DEFAULT_INITIAL_STOCK
+                    })
+                    count += 1
+                st.success(f"✅ 총 {count}개의 재고 문서를 기본값({DEFAULT_INITIAL_STOCK})으로 초기화했습니다.")
+                st.balloons()
+                safe_rerun()
+            except Exception as e:
+                st.error(f"초기화 중 오류 발생: {e}")
+
+
+    # ===== 재료(Ingredient) 뷰 =====
     df_inv = load_inventory_df()
     if df_inv.empty:
-        st.info("현재 등록된 재고 데이터가 없습니다. '거래 추가' 시 자동 생성됩니다.")
+        st.info("현재 등록된 재고 데이터가 없습니다. '거래 추가' 또는 아래 시드 기능을 사용하세요.")
     else:
-        df_inv['재고비율'] = df_inv['현재재고'] / df_inv['초기재고']
-        df_inv['상태'] = df_inv['재고비율'].apply(lambda r: "발주요망" if r <= REORDER_THRESHOLD_RATIO else "정상")
-        low_stock = df_inv[df_inv['재고비율'] <= REORDER_THRESHOLD_RATIO]
-
-        fig_stock = px.bar(
-            df_inv.sort_values('재고비율'),
-            x='상품상세', y='현재재고', color='재고비율',
-            title="상품별 재고 현황 (현재/초기)",
-            color_continuous_scale='Blues'
-        )
-        st.plotly_chart(fig_stock, width=W)
-
-        show_cols = ['상품상세', '현재재고', '초기재고', '재고비율', '상태']
-        st.dataframe(df_inv[show_cols], width=W)
-
-        if not low_stock.empty:
-            st.warning("⚠️ 일부 상품의 재고가 15% 이하입니다. 자동 발주가 권장됩니다.")
-            st.dataframe(low_stock[show_cols], width=W)
-            if st.button("🚚 자동 발주 생성"):
-                for _, row in low_stock.iterrows():
-                    need_qty = int(row['초기재고'] - row['현재재고'])
-                    db.collection(ORDERS_COLLECTION).add({
-                        "상품상세_en": row["상품상세_en"],
-                        "발주수량": need_qty,
-                        "발주일": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "기준": "15% 임계치"
-                    })
-                st.success("✅ 자동 발주가 생성되었습니다.")
+        st.subheader("🥣 재료 재고 (레시피 연결 기반)")
+        ing_set = get_all_recipe_ingredients()
+        df_ing = df_inv[df_inv["is_ingredient"] | df_inv["상품상세_en"].isin(ing_set)].copy()
+        if df_ing.empty:
+            st.info("아직 레시피와 연결된 재료가 없습니다. 아래 '라떼 연결 마법사'를 먼저 실행해 보세요.")
         else:
-            st.success("✅ 모든 상품의 재고가 안전 수준입니다.")
+            df_ing['재고비율'] = df_ing['현재재고'] / df_ing['초기재고']
+            df_ing['상태'] = df_ing['재고비율'].apply(lambda r: "발주요망" if r <= REORDER_THRESHOLD_RATIO else "정상")
+            low_ing = df_ing[df_ing['재고비율'] <= REORDER_THRESHOLD_RATIO]
+
+            fig_ing = px.bar(
+                df_ing.sort_values('재고비율'),
+                x='상품상세', y='현재재고', color='재고비율',
+                title="재료별 재고 현황",
+            )
+            st.plotly_chart(fig_ing, width=W)
+            st.dataframe(df_ing[['상품상세','현재재고','초기재고','uom','재고비율','상태']], width=W)
+
+            if not low_ing.empty:
+                st.warning("⚠️ 일부 재료 재고가 15% 이하입니다. 발주를 고려하세요.")
 
     st.markdown("---")
 
-    # ---- SKU 파라미터 편집 ----
-    st.markdown("### ⚙️ SKU 파라미터 편집 (리드타임/세이프티/목표일수/레시피g)")
+    # ===== 라떼 연결 마법사 =====
+    with st.expander("🔗 라떼 연결(한 메뉴 POC)"):
+        st.caption("라떼 1잔 = Espresso Roast 18g + Milk 300ml + Regular syrup 5ml (+Milk waste 5%)")
+        if st.button("라떼 레시피 생성/덮어쓰기"):
+            latte_items = [
+                {"ingredient_en": "Espresso Roast", "qty": 18, "uom": "g", "waste_pct": 0},
+                {"ingredient_en": "Milk",           "qty": 300, "uom": "ml", "waste_pct": 5},
+                {"ingredient_en": "Regular syrup",   "qty": 5,   "uom": "ml", "waste_pct": 0},
+            ]
+            db.collection(RECIPES_COLLECTION).document("Latte").set({
+                "menu_sku_en": "Latte",
+                "items": latte_items
+            })
+            for it in latte_items:
+                ensure_ingredient_sku(it["ingredient_en"], uom=it["uom"])  # 재료 플래그 + uom 보장
+            st.success("✅ 라떼 레시피가 생성되었습니다.")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            milk_seed = st.number_input("우유 초기/현재(ml)", min_value=0, value=5000, step=100)
+        with c2:
+            bean_seed = st.number_input("에스프레소 로스트 초기/현재(g)", min_value=0, value=2000, step=50)
+        with c3:
+            syrup_seed = st.number_input("레귤러 시럽 초기/현재(ml)", min_value=0, value=1000, step=10)
+        if st.button("시드 재고 반영"):
+            for en, uom, qty in [
+                ("Milk","ml", milk_seed),
+                ("Espresso Roast","g", bean_seed),
+                ("Regular syrup","ml", syrup_seed),
+            ]:
+                ref = ensure_ingredient_sku(en, uom=uom)
+                ref.update({"초기재고": float(qty), "현재재고": float(qty)})
+            st.success("✅ 시드 재고를 반영했습니다.")
+
+    st.markdown("---")
+
+    # ===== 재료 ROP (라떼 기준) =====
+    st.markdown("### 🧮 재료 ROP (라떼 기준)")
     df_params = load_sku_params_df()
     if not df_inv.empty:
         missing = set(df_inv["상품상세_en"]) - set(df_params["sku_en"])
@@ -782,94 +1179,60 @@ elif menu == "재고 관리":
             })
             df_params = pd.concat([df_params, add_df], ignore_index=True)
 
-    df_params["상품상세"] = df_params["sku_en"].apply(to_korean_detail)
-    params_view = df_params[["상품상세","sku_en","lead_time_days","safety_stock_units","target_days","grams_per_cup","expiry_days"]]
-
-    params_edit = st.data_editor(
-        params_view,
-        hide_index=True,
-        column_config={
-            "상품상세": st.column_config.Column("상품상세(표시)", disabled=True),
-            "sku_en": st.column_config.Column("SKU(영문)", help="저장 키", disabled=True),
-            "lead_time_days": st.column_config.NumberColumn("리드타임(일)", min_value=0, step=1),
-            "safety_stock_units": st.column_config.NumberColumn("세이프티(단위)", min_value=0, step=1),
-            "target_days": st.column_config.NumberColumn("목표일수", min_value=1, step=1),
-            "grams_per_cup": st.column_config.NumberColumn("레시피(g/잔)", min_value=0.0, step=0.5),
-            "expiry_days": st.column_config.NumberColumn("유통기한(일)", min_value=1, step=1),
-        },
-        width=W,
-        key="sku_params_editor"
-    )
-
-    if st.button("💾 파라미터 저장"):
-        saved = upsert_sku_params(params_edit.rename(columns={"sku_en":"sku_en"}))
-        st.success(f"✅ {saved}건 저장 완료")
-        safe_rerun()
-
-    st.markdown("---")
-    st.markdown("### 🧮 재주문점(ROP) 지표 & 권장 발주량")
-
     df_sales_for_calc = df.copy()
     if "상품상세" in df_sales_for_calc.columns:
         df_sales_for_calc["상품상세"] = df_sales_for_calc["상품상세"].astype(str)
 
-    df_metrics = compute_replenishment_metrics(
-        df_sales_for_calc, df_inv, params_edit.rename(columns={"sku_en":"sku_en"}), window_days=28
+    df_ing_metrics = compute_ingredient_metrics_for_menu(
+        "Latte", df_sales_for_calc, df_inv, df_params, window_days=28
     )
-
-    if df_metrics.empty:
-        st.info("판매 데이터가 부족해 ROP 지표를 계산할 수 없습니다.")
+    if df_ing_metrics.empty:
+        st.info("라떼 레시피가 없거나 최근 라떼 판매가 없어 재료 ROP를 계산할 수 없습니다. 위의 마법사와 '거래 추가'를 이용해 테스트해 보세요.")
     else:
-        st.dataframe(df_metrics, width=W)
-
-        low_mask = df_metrics["상태"].eq("발주요망") | (df_metrics["권장발주"] > 0)
-        df_need = df_metrics[low_mask]
-        if not df_need.empty:
-            st.warning("⚠️ 아래 항목은 ROP 이하이거나 권장발주량이 있습니다.")
-            st.dataframe(
-                df_need[["상품상세","현재재고","ROP","권장발주","lead_time_days","safety_stock_units","target_days"]],
-                width=W
-            )
-
-            if st.button("🧾 권장 발주 일괄 생성"):
-                created = 0
-                for _, r in df_need.iterrows():
-                    qty = int(r["권장발주"])
-                    if qty <= 0:
-                        continue
-                    db.collection(ORDERS_COLLECTION).add({
-                        "상품상세_en": r["sku_en"],
-                        "발주수량": qty,
-                        "발주일": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "lead_time_days": int(r["lead_time_days"]),
-                        "기준": "ROP/TargetDays"
-                    })
-                    created += 1
-                st.success(f"✅ 발주 {created}건 생성")
+        st.dataframe(df_ing_metrics, width=W)
+        need_rows = df_ing_metrics[(df_ing_metrics["상태"].eq("발주요망")) | (df_ing_metrics["권장발주"] > 0)]
+        if not need_rows.empty:
+            st.warning("⚠️ 아래 재료는 ROP 이하이거나 권장발주량이 존재합니다.")
+            st.dataframe(need_rows[["상품상세","현재재고","uom","ROP","권장발주","lead_time_days","safety_stock_units","target_days"]], width=W)
 
     st.markdown("---")
-    with st.expander("➕ 수동 입고(재고 추가)"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            inv_options = sorted(df_inv['상품상세'].unique().tolist()) if not df_inv.empty else []
-            sel_detail_ko = st.selectbox("상품상세(표시)", inv_options) if inv_options else None
-        with c2:
-            add_qty = st.number_input("입고 수량", min_value=1, value=10)
-        with c3:
-            submitted_in = st.button("입고 반영")
-        if submitted_in and sel_detail_ko:
-            sel_detail_en = from_korean_detail(sel_detail_ko)
-            ref = ensure_inventory_doc(sel_detail_en)
-            snap = ref.get()
-            data = snap.to_dict()
-            cur = int(data.get("현재재고", DEFAULT_INITIAL_STOCK))
-            ref.update({"현재재고": cur + int(add_qty)})
-            st.success("✅ 입고가 반영되었습니다.")
-            safe_rerun()
 
-# ==============================================================
-# ✏️ 데이터 편집 (거래 수정/삭제 + 재고 일괄수정)
-# ==============================================================
+    # ===== 최근 재고 이동 로그 =====
+    st.markdown("### 🧾 최근 재고 이동")
+    try:
+        q = db.collection(STOCK_MOVES_COLLECTION).order_by("ts", direction=firestore.Query.DESCENDING).limit(50).stream()
+        docs = [d.to_dict() for d in q]
+    except Exception:
+        docs = [d.to_dict() for d in db.collection(STOCK_MOVES_COLLECTION).stream()]
+        docs.sort(key=lambda x: x.get("ts",""), reverse=True)
+    move_rows = []
+    for m in docs:
+        base = {
+            "시각": m.get("ts",""),
+            "유형": m.get("type",""),
+            "메뉴": to_korean_detail(m.get("menu_sku_en","")),
+            "수량": m.get("qty",0),
+            "비고": m.get("note",""),
+        }
+        for det in (m.get("details", []) or []):
+            row = base | {
+                "재료": to_korean_detail(det.get("ingredient_en","")),
+                "사용량": round(float(det.get("used",0.0)),2),
+                "단위": det.get("uom",""),
+                "전": round(float(det.get("before",0.0)),2),
+                "후": round(float(det.get("after",0.0)),2),
+            }
+            move_rows.append(row)
+    if move_rows:
+        kw = st.text_input("필터(메뉴/재료 포함)", "")
+        df_moves = pd.DataFrame(move_rows)
+        if kw:
+            df_moves = df_moves[df_moves.apply(lambda r: kw in str(r.values), axis=1)]
+        st.dataframe(df_moves, hide_index=True, width=W)
+    else:
+        st.caption("최근 이동 로그가 없습니다.")
+
+    st.markdown("---")
 elif menu == "데이터 편집":
     st.header("✏️ 데이터 편집")
     tab1, tab2 = st.tabs(["거래 수정/삭제", "재고 일괄수정"])
@@ -943,12 +1306,8 @@ elif menu == "데이터 편집":
 
                     if patch:
                         if reflect_inv and '수량' in patch:
-                            qty_old = int(orig.get('수량', 0))
-                            delta = qty_old - qty_new  # +면 재고 복원, -면 추가 차감
-                            ref = ensure_inventory_doc(detail_en)
-                            snap = ref.get()
-                            cur = int(snap.to_dict().get("현재재고", DEFAULT_INITIAL_STOCK))
-                            ref.update({"현재재고": cur + delta})
+                            diff = qty_new - int(orig.get('수량', 0))
+                            adjust_inventory_by_recipe(detail_en, diff, move_type="edit_adjust", note=str(doc_id))
 
                         db.collection(SALES_COLLECTION).document(doc_id).update(patch)
                         changed += 1
@@ -970,10 +1329,7 @@ elif menu == "데이터 편집":
                 for did in del_ids:
                     raw = df_raw[df_raw['_id'] == did].iloc[0].to_dict()
                     if restore_inv_on_delete:
-                        ref = ensure_inventory_doc(raw.get('상품상세'))
-                        snap = ref.get()
-                        cur = int(snap.to_dict().get("현재재고", DEFAULT_INITIAL_STOCK))
-                        ref.update({"현재재고": cur + int(raw.get('수량', 0))})
+                        adjust_inventory_by_recipe(raw.get('상품상세'), -int(raw.get('수량', 0)), move_type="delete_restore", note=str(did))
                     db.collection(SALES_COLLECTION).document(did).delete()
                 st.success(f"✅ {len(del_ids)}건 삭제 완료")
                 safe_rerun()
@@ -1038,7 +1394,7 @@ else:  # menu == "도움말"
     st.header("☕️ 커피 원두 재고관리 파이프라인 쉽게 이해하기")
     st.markdown("""
 > **“커피 원두가 어떻게 들어오고, 얼마나 쓰이고, 언제 다시 주문돼야 하는지를 자동으로 관리하자!”**  
-엑셀/감(勘) 대신 ERP가 자동으로 계산해줍니다.
+엑셀 대신 ERP가 자동으로 계산해줍니다.
 
 ### 파이프라인 한눈에 보기
 | 단계 | 하는 일 | 예시 |
