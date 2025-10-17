@@ -77,7 +77,13 @@ for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR):
 # ----------------------
 # 0-1️⃣ Firebase 초기화 (Secrets → keys/ → GOOGLE_APPLICATION_CREDENTIALS)
 # ----------------------
+# ----------------------
+# 0-1️⃣ Firebase 초기화 (Secrets → keys/ → GOOGLE_APPLICATION_CREDENTIALS)
+# ----------------------
+@st.cache_resource
 def init_firestore():
+    """Firebase 인증 및 Firestore 클라이언트 초기화 (중복 호출 방지 + 캐시 적용)"""
+    # 이미 초기화된 경우 재사용
     if firebase_admin._apps:
         return firestore.client()
 
@@ -94,13 +100,13 @@ def init_firestore():
         firebase_admin.initialize_app(cred)
         return firestore.client()
 
-    # 3) GOOGLE_APPLICATION_CREDENTIALS (파일 경로)
+    # 3) GOOGLE_APPLICATION_CREDENTIALS (환경 변수)
     gac = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     if gac and Path(gac).expanduser().exists():
         firebase_admin.initialize_app()
         return firestore.client()
 
-    # 4) 전부 실패 → 명시적으로 에러
+    # 4) 자격증명 실패 시
     st.error(
         "Firebase 자격증명을 찾을 수 없습니다.\n"
         "다음 중 하나를 설정하세요:\n"
@@ -109,6 +115,7 @@ def init_firestore():
         "• 환경변수 GOOGLE_APPLICATION_CREDENTIALS=자격증명파일경로"
     )
     st.stop()
+
 
 db = init_firestore()
 
