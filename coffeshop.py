@@ -9,6 +9,7 @@
 # ==============================================================
 
 import os
+import json
 import re
 import warnings
 from math import ceil
@@ -22,6 +23,28 @@ import plotly.io as pio
 
 import firebase_admin
 from firebase_admin import credentials, firestore
+
+st.set_page_config(page_title="☕ Coffee ERP Dashboard", layout="wide")
+
+
+def init_firebase():
+    try:
+        if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in os.environ:
+            cred_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+            cred = credentials.Certificate(cred_info)
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app(cred)
+            return firestore.client(), "success"
+        else:
+            return None, "no_env"
+    except Exception as e:
+        return None, f"error: {e}"
+
+# ✅ 함수 호출 후 UI 표시 분리
+db, fb_status = init_firebase()
+
+
+
 
 # --- Pylance/static analyzer guards (no runtime effect) ---
 items = []  # type: ignore
@@ -122,26 +145,80 @@ db = init_firestore()
 # ----------------------
 # 0-2️⃣ UI/스타일
 # ----------------------
-st.set_page_config(page_title="☕ Coffee ERP Dashboard", layout="wide")
 pio.templates.default = "plotly_white"
 px.defaults.template = "plotly_white"
 px.defaults.color_continuous_scale = "Blues"
 
 st.markdown("""
     <style>
-    .stApp { background-color: #F4F6FA; font-family: 'Pretendard','Noto Sans KR',sans-serif; }
-    .dashboard-header { display:flex; align-items:center; gap:12px; background:#1E2A38; color:#fff;
-                        padding:15px 25px; border-radius:10px; margin-bottom:25px; }
-    .metric-card { background:#fff; border-radius:16px; padding:25px;
-                   box-shadow:0 4px 12px rgba(0,0,0,0.06); text-align:center; transition:all .3s; }
-    .metric-card:hover { transform: translateY(-3px); box-shadow:0 6px 14px rgba(0,0,0,0.12); }
+    /* 전체 배경 (라이트/다크모드 대응) */
+    .stApp {
+        background-color: var(--background-color);
+        font-family: 'Pretendard','Noto Sans KR',sans-serif;
+    }
+    [data-theme="dark"] .stApp {
+        background-color: #0e1117 !important;
+        color: #fafafa !important;
+    }
+
+    /* 헤더 */
+    .dashboard-header {
+        display:flex;
+        align-items:center;
+        gap:12px;
+        background: #1E2A38;
+        color:#fff;
+        padding:15px 25px;
+        border-radius:10px;
+        margin-bottom:25px;
+    }
+
+    /* 카드 */
+    .metric-card {
+        background:#fff;
+        border-radius:16px;
+        padding:25px;
+        box-shadow:0 4px 12px rgba(0,0,0,0.06);
+        text-align:center;
+        transition:all .3s;
+    }
+    [data-theme="dark"] .metric-card {
+        background:#1c1f26 !important;
+        color:#fafafa !important;
+    }
+
+    .metric-card:hover {
+        transform: translateY(-3px);
+        box-shadow:0 6px 14px rgba(0,0,0,0.12);
+    }
     .metric-title { color:#7C8DA6; font-size:1em; }
     .metric-value { color:#2C3E50; font-size:1.8em; font-weight:600; }
-    section[data-testid="stSidebar"] { background:#fff !important; color:#0D3B66 !important; }
-    label[data-baseweb="radio"] div { color:#0D3B66 !important; font-weight:500; }
-    .js-plotly-plot .plotly { background:transparent !important; }
+    [data-theme="dark"] .metric-title { color:#9ea6b3; }
+    [data-theme="dark"] .metric-value { color:#ffffff; }
+
+    section[data-testid="stSidebar"] {
+        background:#fff !important;
+        color:#0D3B66 !important;
+    }
+    [data-theme="dark"] section[data-testid="stSidebar"] {
+        background:#1c1f26 !important;
+        color:#fafafa !important;
+    }
+
+    label[data-baseweb="radio"] div {
+        color:#0D3B66 !important;
+        font-weight:500;
+    }
+    [data-theme="dark"] label[data-baseweb="radio"] div {
+        color:#fafafa !important;
+    }
+
+    .js-plotly-plot .plotly {
+        background:transparent !important;
+    }
     </style>
 """, unsafe_allow_html=True)
+
 
 st.markdown("""
 <div class="dashboard-header">
@@ -892,7 +969,7 @@ def compute_ingredient_metrics_for_menu(
 
 
 # 공통 width 설정
-W = "stretch"
+W = None
 
 # ----------------------
 # 5️⃣ 사이드바 메뉴
@@ -1127,6 +1204,8 @@ elif menu == "재고 관리":
                 title="재료별 재고 현황",
             )
             st.plotly_chart(fig_ing, width=W)
+            st.caption(f"현재 데이터 크기: {len(df)}행")
+            st.dataframe(df.head(1000))  # 전체가 아니라 1000행만 보여주기
             st.dataframe(df_ing[['상품상세','현재재고','초기재고','uom','재고비율','상태']], width=W)
 
             if not low_ing.empty:
@@ -1196,6 +1275,8 @@ elif menu == "재고 관리":
     if df_ing_metrics.empty:
         st.info("라떼 레시피가 없거나 최근 라떼 판매가 없어 재료 ROP를 계산할 수 없습니다. 위의 마법사와 '거래 추가'를 이용해 테스트해 보세요.")
     else:
+        st.caption(f"현재 데이터 크기: {len(df)}행")
+        st.dataframe(df.head(1000))  # 전체가 아니라 1000행만 보여주기
         st.dataframe(df_ing_metrics, width=W)
         need_rows = df_ing_metrics[(df_ing_metrics["상태"].eq("발주요망")) | (df_ing_metrics["권장발주"] > 0)]
         if not need_rows.empty:
@@ -1392,7 +1473,11 @@ elif menu == "거래 내역":
     else:
         cols = ['날짜','상품카테고리','상품타입','상품상세','수량','단가','수익','요일','시']
         cols = [c for c in cols if c in df.columns]
-        st.dataframe(df[cols].sort_values('날짜', ascending=False), width=W)
+        st.caption(f"현재 데이터 크기: {len(df)}행")
+        st.dataframe(df.head(1000))  # 전체가 아니라 1000행만 보여주기
+        st.dataframe(df[cols].sort_values('날짜', ascending=False), width=None)
+
+
 
 # ==============================================================
 # ❓ 도움말
