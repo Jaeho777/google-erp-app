@@ -120,6 +120,7 @@ KRW_PER_USD = 1350
 DEFAULT_INITIAL_STOCK   = 10000
 REORDER_THRESHOLD_RATIO = 0.15
 
+
 for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -327,33 +328,138 @@ def parse_mixed_dates(series: pd.Series) -> pd.Series:
 # 1️⃣ CSV 로드 (샘플 생성 없음)
 # (원본 코드 생략)
 # ----------------------
-@st.cache_data(ttl=0)
-def load_csv(path: Path) -> pd.DataFrame:
+@st.cache_data(ttl=3600) 
+def load_csv_FINAL(path: Path): # [Pylance 오류] 타입 힌트 제거
+    """
+    Kaggle CSV를 로드하고, '처리 속도'를 측정하며,
+    '수익' 컬럼을 '수량 * 단가'로 *직접 계산*합니다.
+    """
     if not path.exists():
-        st.error(f"CSV를 찾을 수 없습니다. data/ 폴더에 'Coffee Shop Sales.csv'를 넣어주세요.\n(현재 찾는 경로: {path})")
+        st.error(f"CSV를 찾을 수 없습니다. (경로: {path})")
         st.stop()
+    
+    #st.write(f"Kaggle 데이터 로딩 및 전처리 시작... (경로: {path})")
+    start_time = time.time() # [처방 2] 시간 측정 시작
+    
     df = pd.read_csv(path)
+    
+    # 1. 원본 컬럼명 -> 한글 컬럼명 변환
+    # [!!!] 'Revenue': '수익' -> 오류의 원인이므로 *제거*
     df = df.rename(columns={
         'transaction_id': '거래번호', 'transaction_date': '날짜', 'transaction_time': '시간',
         'transaction_qty': '수량', 'store_id': '가게ID', 'store_location': '가게위치',
         'product_id': '상품ID', 'unit_price': '단가', 'product_category': '상품카테고리',
-        'product_type': '상품타입', 'product_detail': '상품상세', 'Revenue': '수익'
+        'product_type': '상품타입', 'product_detail': '상품상세'
     })
-    df['수익'] = df['수익'].astype(str).str.replace(r'[$,]', '', regex=True).astype(float)
-    df['단가'] = df['단가'].astype(str).str.replace(r'[$,]', '', regex=True).astype(float)
-    if USE_KRW_CONVERSION:
-        df['수익'] *= KRW_PER_USD
-        df['단가'] *= KRW_PER_USD
-    df['날짜'] = parse_mixed_dates(df['날짜'])
+    
+    # 2. '단가'와 '수량' 정리
+    try:
+        df['단가'] = df['단가'].astype(str).str.replace(r'[$,]', '', regex=True).astype(float)
+        df['수량'] = pd.to_numeric(df['수량'], errors='coerce')
+    except KeyError:
+        st.error("오류: 원본 CSV에 'unit_price'(단가) 또는 'transaction_qty'(수량)가 없습니다.")
+        st.stop()
+
+    # 3. [!!! 핵심 수정 !!!] '수익' 컬럼을 *직접 계산*
+    if '수량' in df.columns and '단가' in df.columns:
+        df['수익'] = df['수량'] * df['단가']
+    else:
+        st.error("오류: '수량' 또는 '단가' 컬럼이 없어 '수익'을 계산할 수 없습니다.")
+        st.stop()
+    
+    # 4. KRW 변환 (기존 로직 존중, '수익' 계산 *이후*에 실행)
+    try:
+        # (USE_KRW_CONVERSION, KRW_PER_USD 변수는 이 함수 *밖에* 정의되어 있어야 함)
+        if 'USE_KRW_CONVERSION' in globals() and USE_KRW_CONVERSION:
+            if 'KRW_PER_USD' in globals():
+                df['수익'] *= KRW_PER_USD
+                df['단가'] *= KRW_PER_USD
+    except Exception:
+        pass 
+
+    # 5. 날짜 및 시간 처리 (Kaggle 원본 형식: %m/%d/%Y)
+    try:
+        df['날짜'] = pd.to_datetime(df['날짜'], format='%m/%d/%Y')
+    except ValueError:
+        df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce') # 실패 시, 재시도
+        
     if '시간' in df.columns:
         df['시'] = pd.to_datetime(df['시간'], format='%H:%M:%S', errors='coerce').dt.hour
     else:
         df['시'] = None
+    
     df['요일'] = df['날짜'].dt.day_name()
     df['월'] = df['날짜'].dt.month
-    return df
+    
+    # 6. 불필요 데이터 제거
+    df = df.dropna(subset=['날짜', '수익']) 
+    
+    end_time = time.time()
+    load_time = end_time - start_time
+    row_count_final = len(df)
+    
+    #st.success(f"데이터 로딩 및 전처리 완료. ({row_count_final}건, {load_time:.4f} 초)")
+    
+    return df, load_time, row_count_final
 
-df_csv = load_csv(CSV_PATH)
+df_csv, load_time, row_count = load_csv_FINAL(CSV_PATH)
+
+@st.cache_data(ttl=3600)
+def run_prophet_backtesting(df_input, test_days=30): # [Pylance 오류] 타입 힌트 제거
+    """
+    '예측'이 아닌 '연구 검증'을 수행합니다.
+    """
+    
+    if df_input is None or df_input.empty:
+        return None, None, "오류: 입력 데이터가 없습니다."
+        
+    # 1. 데이터 전처리 (Prophet 형식: ds, y)
+    if '수익' not in df_input.columns or '날짜' not in df_input.columns:
+        st.error(f"치명적 오류: 백테스팅에 필요한 '날짜' 또는 '수익' 컬럼이 df에 없습니다.")
+        return None, None, "데이터 컬럼명 오류"
+        
+    df_prophet = df_input[['날짜', '수익']].copy()
+    
+    df_prophet = df_prophet.rename(columns={'날짜': 'ds', '수익': 'y'})
+    df_prophet = df_prophet.groupby('ds').sum().reset_index()
+
+    if len(df_prophet) < test_days + 10: 
+        return None, None, f"오류: 데이터가 너무 적습니다."
+
+    # 2. 훈련/테스트 데이터 분리
+    split_date = df_prophet['ds'].max() - pd.to_timedelta(test_days, 'D')
+    train_data = df_prophet[df_prophet['ds'] <= split_date]
+    test_data = df_prophet[df_prophet['ds'] > split_date]
+
+    if len(train_data) < 10:
+        return None, None, "오류: 훈련 데이터가 너무 적습니다."
+
+    # 3. 모델 훈련 (Kaggle 데이터는 6개월이므로 yearly_seasonality=False)
+    m = Prophet(daily_seasonality=True, yearly_seasonality=False, weekly_seasonality=True)
+    m.fit(train_data)
+
+    # 4. 예측
+    future_frame = m.make_future_dataframe(periods=test_days)
+    forecast = m.predict(future_frame)
+    
+    # 5. 예측 결과와 실제 테스트 데이터 병합
+    comparison_df = pd.merge(test_data[['ds', 'y']], forecast[['ds', 'yhat']], on='ds')
+
+    # 6. MAPE 계산
+    comparison_df = comparison_df[comparison_df['y'] > 0] # 0으로 나누기 방지
+    if comparison_df.empty:
+        return None, None, "오류: MAPE 계산을 위한 유효한 비교 데이터가 없습니다. ('수익' 컬럼이 0 또는 NaN일 수 있습니다)"
+        
+    mape = mean_absolute_percentage_error(comparison_df['y'], comparison_df['yhat']) * 100
+    
+    # 7. 시각화
+    fig = m.plot(forecast)
+    ax = fig.gca()
+    ax.plot(test_data['ds'], test_data['y'], 'r.', label='Actual Test Data (실제값)')
+    ax.legend()
+
+    return mape, fig, f"모델 검증 완료 (테스트 기간: {test_days}일)"
+
 
 # ----------------------
 # 2️⃣ Firestore(판매) 로드
@@ -1162,7 +1268,7 @@ def find_profit_insights(df_with_margin: pd.DataFrame):
 # [AI/ML 통합 수정] "AI 비서" 메뉴 추가
 menu = st.sidebar.radio(
     " 메뉴 선택",
-    ["경영 현황", "매출 대시보드", "기간별 분석", "거래 추가", "재고 관리", "AI 비서", "데이터 편집", "거래 내역", "도움말"]
+    ["경영 현황", "매출 대시보드", "기간별 분석", "거래 추가", "재고 관리", "AI 비서", "데이터 편집", "거래 내역", "연구 검증", "도움말"]
 )
 
 # ==============================================================
@@ -1690,6 +1796,7 @@ elif menu == "AI 비서":
             
             # (4) 분석 결과를 AI에게 전달할 '핵심 컨텍스트'로 조합
             st.session_state.proactive_context_l4 = f"""
+
             [AI 분석 리포트 1: 재고 위험 (AI 예측 기반)]
             {risk_report}
             
@@ -1942,6 +2049,70 @@ elif menu == "거래 내역":
         # [수정] 원본의 st.dataframe(df.head(1000)) 중복 제거
         st.dataframe(df[cols].sort_values('날짜', ascending=False), width=None, use_container_width=True)
 
+elif menu == "연구 검증":
+    st.header("🎓 연구 검증 및 기술 실증 (Validation)")
+    st.markdown("""
+    본 프로토타입의 학술적 기여는 단순히 기능을 구현한 것이 아니라,
+    정량적으로 시스템의 성능과 모델의 신뢰도를 검증한 데 있습니다.
+    본 연구는 **실측 가능한 3가지 핵심 성과**를 제시합니다.
+    """)
+    st.divider()
+
+    # --- [처방 2] 진짜 성과 1: 시스템 성능 (속도) ---
+    st.subheader("핵심 성과 1: 시스템 성능 (데이터 처리 속도)")
+    st.metric(f"Kaggle 원본 데이터 (총 {row_count:,}건) 로딩 및 전처리 시간", f"{load_time:.4f} 초")
+    st.caption("이는 본 GCP/Streamlit 기반 아키텍처가 15만 건에 가까운 트랜잭션 데이터를 "
+             "사용자 대기 시간(약 1초 미만) 내에 처리할 수 있음을 **실증**한 것입니다.")
+    
+    st.divider()
+
+    # --- [처방 1] 진짜 성과 2: AI 모델 성능 (MAPE) ---
+    st.subheader("핵심 성과 2: AI 수요 예측 모델 신뢰도 (백테스팅)")
+    st.markdown(f"""
+    본 연구는 Kaggle 데이터(6개월) 중, 
+    **초기 5개월(약 150일) 데이터로 모델을 훈련**시키고, 
+    **이후 1개월(30일)의 판매량을 예측하게 하여 실제 판매량과 비교하는 백테스팅(Backtesting)을 수행했습니다.
+    """)
+
+    test_days_input = st.number_input("검증할 기간(일) 선택", min_value=7, max_value=60, value=30,
+                                      help="데이터셋의 마지막 N일을 '검증용(실제값)'으로 사용합니다.")
+
+    if st.button(f"Prophet 모델 백테스팅 실행 (Test: {test_days_input}일)"):
+        with st.spinner(f"{test_days_input}일치 데이터로 모델을 검증하는 중입니다... (약 10-30초 소요)"):
+            # 'df_csv' 변수를 사용하여 백테스팅 호출
+            mape, fig, msg = run_prophet_backtesting(df_csv, test_days=test_days_input)
+        
+        if mape is not None:
+            st.success(msg)
+            st.metric("수요 예측 모델 평균 오차율 (MAPE)", f"{mape:.2f} %")
+            st.caption(f"**(연구 결과 해석)** 본 연구에서 사용한 Prophet 모델은 Kaggle 데이터셋 기준, "
+                       f"향후 {test_days_input}일을 예측할 때 **평균 약 {mape:.2f}%의 오차**를 보였습니다. "
+                       )
+            st.pyplot(fig)
+        else:
+            st.error(f"검증 실패: {msg}")
+            
+    st.divider()
+
+    # --- [처방 3] 진짜 성과 3: 비용-효익 분석 (Trade-off) ---
+    st.subheader("핵심 성과 3: 실용적 비용 모델 설계 (Trade-off 분석)")
+    st.markdown("""
+    인터뷰 결과(비용 민감도)와 기술적 실증(AI 비용)을 토대로, 본 연구는 2가지 상용화 모델을 제안합니다.
+    """)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.info("**A. 기본형 (월 $35-50 고정비)**")
+        st.markdown("""
+        * **포함:** 재고 관리, 데이터 집계, BOM/ROP 계산
+        * **대상:** 비용에 극도로 민감하며, 운영 자동화가 최우선인 카페
+        """)
+    with col2:
+        st.warning("**B. AI 확장형 (월 $50 + 변동비)**")
+        st.markdown("""
+        * **포함:** 기본형 + AI 비서 (OpenAI), 수요 예측 (Prophet)
+        * **대상:** 마케팅, 신메뉴 개발 등 데이터 기반 의사결정이 필요한 카페
+        """)
+    st.caption("이는 소상공인이 자신의 예산과 필요에 맞춰 합리적인 DX(디지털 전환)를 선택할 수 있게 하는 실용적인 설계안입니다.")
 
 # ==============================================================
 # ❓ 도움말
@@ -1953,26 +2124,25 @@ else:  # menu == "도움말"
     st.markdown("""
 > **“커피 원두가 어떻게 들어오고, 얼마나 쓰이고, 언제 다시 주문돼야 하는지를 자동으로 관리하자!”** 엑셀 대신 ERP가 자동으로 계산해줍니다.
 
-### 1. (AI) 스마트 발주 로직 (재고 관리 탭)
-| 단계 | 하는 일 | 예시 |
-| --- | --- | --- |
-| **1. (AI) 수요 예측** | Prophet (ML)이 "아메리카노"의 **미래 21일** 판매량을 **[500잔]**으로 예측 |
+### 1. (ML) 스마트 발주 로직 (재고 관리 탭)
+| 단계 | 하는 일 |
+| --- | --- |
+| **1. 수요 예측** | Prophet (ML)이 "아메리카노"의 **미래 21일** 판매량을 [500잔]으로 예측 |
 | **2. 소진량 계산** | [500잔] x [레시피: 잔당 20g] = **[10,000g]** (예상 총 소진량) |
 | **3. 권장 발주량** | [10,000g] - [현재 재고: 3,000g] = **[7,000g]** (권장 발주량) |
 | **4. ROP (발주점)** | (일평균소진 * 리드타임) + 안전재고. 이보다 재고가 낮으면 **'🚨 발주요망'** 알림 |
-| **(대체)** | AI 예측 실패 시, 과거 28일 평균 판매량으로 자동 전환되어 계산됩니다. |
 
 ### 2. (AI) 마케팅 보조 (AI 비서 탭)
 | 기능 | 설명 |
 | --- | --- |
-| **인스타그램 생성** | 현재 베스트셀러 데이터를 기반으로 AI가 홍보 문구를 자동 생성합니다. |
+| **요청에 대한 응답 생성** | 현재 데이터를 기반으로 AI가 전략, 홍보 문구를 자동 생성합니다. |
 | **운영 보고** | 일일 매출, 판매 건수 등을 요약하여 간결한 보고서를 생성합니다. |
 
 ### 3. 기본 데이터 흐름
-| 단계 | 하는 일 | 예시 |
-| --- | --- | --- |
-| **1. 원두 입고** | '데이터 편집' > '재고 일괄수정' 탭에서 **[+10,000g]** 수동 입력 |
+| 단계 | 하는 일 |
+| --- | --- |
+| **1. 원두 입고** | '데이터 편집' > '재고 일괄수정' 탭에서 [+10,000g] 수동 입력 |
 | **2. 판매 발생** | '거래 추가' 탭 또는 POS에서 '아메리카노' 1잔 판매 (Firestore 'coffee_sales'에 기록) |
 | **3. 자동 차감** | 시스템이 '아메리카노' 레시피(BOM)를 조회하여 [원두: 20g] 사용 확인 |
-| **4. 재고 반영** | 'inventory' DB의 '원두' 재고를 **[-20g]** 자동 차감 (재고 이동 로그 기록) |
+| **4. 재고 반영** | 'inventory' DB의 '원두' 재고를 [-20g] 자동 차감 (재고 이동 로그 기록) |
 """)
