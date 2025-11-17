@@ -1,10 +1,10 @@
-altair==5.5.0
-attrs==25.3.0
+altair
+attrs
 blinker==1.9.0
 cachetools==5.5.2
-certifi==2025.8.3
+certifi
 charset-normalizer==3.4.3
-click==8.2.1
+click
 db-dtypes==1.4.3
 gitdb==4.0.12
 GitPython==3.1.45

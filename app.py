@@ -7,7 +7,6 @@ import os
 from google.cloud import bigquery
 
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/jaeholee/Desktop/google-erp-app/keys/service-account.json"
-
 # ✅ 서비스 계정 인증
 client = bigquery.Client(location="US")
 
