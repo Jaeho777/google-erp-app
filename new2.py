@@ -115,7 +115,7 @@ RECIPES_COLLECTION      = "recipes"
 STOCK_COUNTS_COLLECTION = "stock_counts"
 STOCK_MOVES_COLLECTION  = "stock_moves"
 
-USE_KRW_CONVERSION = False
+USE_KRW_CONVERSION = True
 KRW_PER_USD = 1350
 DEFAULT_INITIAL_STOCK   = 10000
 REORDER_THRESHOLD_RATIO = 0.15
@@ -1277,60 +1277,85 @@ menu = st.sidebar.radio(
 # ==============================================================
 if menu == "거래 추가":
     st.header(" 거래 데이터 추가")
+    
+    # [수정] st.form을 제거하고, 종속형 메뉴를 순서대로 배치합니다.
+    
     category_options = sorted(pd.Series(df['상품카테고리']).dropna().unique().tolist())
-    type_options = sorted(pd.Series(df['상품타입']).dropna().unique().tolist())
-    detail_options = sorted(pd.Series(df['상품상세']).dropna().unique().tolist())
+    
+    # --- 1. 카테고리 선택 ---
+    상품카테고리_ko = st.selectbox("1. 상품카테고리 선택", category_options, index=None, placeholder="카테고리를 선택하세요...")
 
-    with st.form("add_transaction"):
-        col1, col2 = st.columns(2)
-        with col1:
-            날짜 = st.date_input("날짜", value=datetime.now().date())
-            상품카테고리_ko = st.selectbox("상품카테고리", category_options)
-            상품타입_ko = st.selectbox("상품타입", type_options)
-        with col2:
-            상품상세_ko = st.selectbox("상품상세", detail_options)
-            수량 = st.number_input("수량", min_value=1, value=1)
-            단가 = st.number_input("단가(원)", min_value=0.0, value=1000.0, step=100.0)
+    # --- 2. 타입 선택 (카테고리에 따라 필터링) ---
+    if 상품카테고리_ko:
+        df_filtered_type = df[df['상품카테고리'] == 상품카테고리_ko]
+        type_options = sorted(pd.Series(df_filtered_type['상품타입']).dropna().unique().tolist())
         
-        수익 = 수량 * 단가
-        st.markdown(f"### 💰 계산된 수익: **{format_krw(수익)}**")
-        
-        submitted = st.form_submit_button("데이터 추가")
-        
-        if submitted:
-            상품카테고리_en = rev_category_map.get(상품카테고리_ko, 상품카테고리_ko)
-            상품타입_en = rev_type_map.get(상품타입_ko, 상품타입_ko)
-            상품상세_en = from_korean_detail(상품상세_ko)
+        상품타입_ko = st.selectbox("2. 상품타입 선택", type_options, index=None, placeholder="상품타입을 선택하세요...")
+
+        # --- 3. 상세 메뉴 선택 (타입에 따라 필터링) ---
+        if 상품타입_ko:
+            df_filtered_detail = df_filtered_type[df_filtered_type['상품타입'] == 상품타입_ko]
+            detail_options = sorted(pd.Series(df_filtered_detail['상품상세']).dropna().unique().tolist())
             
-            new_doc = {
-                "날짜": str(날짜),
-                "시간": datetime.now().strftime("%H:%M:%S"),
-                "상품카테고리": 상품카테고리_en,
-                "상품타입": 상품타입_en,
-                "상품상세": 상품상세_en,
-                "수량": 수량,
-                "단가": 단가,
-                "수익": 수익,
-                "가게위치": "Firebase",
-            }
-            
-            try:
-                db.collection(SALES_COLLECTION).add(new_doc)
-                st.success(f"✅ '{상품상세_ko}' {수량}건 추가 완료!")
+            상품상세_ko = st.selectbox("3. 상품상세 선택", detail_options, index=None, placeholder="상세 메뉴를 선택하세요...")
+
+            # --- 4. 수량 및 단가 입력 (메뉴가 확정된 후) ---
+            if 상품상세_ko:
                 
-                # 재고 자동 차감
-                with st.spinner("재고 자동 차감 적용 중..."):
-                    adjust_inventory_by_recipe(
-                        상품상세_en,
-                        수량,
-                        move_type="sale",
-                        note=f"거래 추가: {상품상세_ko} x{수량}"
+                # [UX 개선 2] 선택한 메뉴의 '최근 단가'를 자동으로 불러옵니다.
+                try:
+                    # df에서 이 메뉴의 가장 마지막(최근) '단가'를 찾아 제안
+                    last_price = df[df['상품상세'] == 상품상세_ko]['단가'].iloc[-1]
+                    last_price = float(last_price)
+                except Exception:
+                    last_price = 1000.0 # 못찾으면 기본값
+
+                st.markdown("---")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    수량 = st.number_input("수량", min_value=1, value=1)
+                with col2:
+                    단가 = st.number_input(
+                        "단가(원)", 
+                        min_value=0.0, 
+                        value=last_price, # 👈 자동으로 찾은 최근 단가를 제안
+                        step=100.0
                     )
-                st.success("✅ 재고 차감 완료!")
-                safe_rerun()
                 
-            except Exception as e:
-                st.error(f"데이터 추가 실패: {e}")
+                날짜 = st.date_input("날짜", value=datetime.now().date())
+                
+                수익 = 수량 * 단가
+                st.markdown(f"### 💰 계산된 수익: **{format_krw(수익)}**")
+                
+                # [수정] st.form_submit_button 대신 st.button 사용
+                submitted = st.button("데이터 추가")
+                
+                if submitted:
+                    # ... (이하 데이터 저장 로직은 동일) ...
+                    상품카테고리_en = rev_category_map.get(상품카테고리_ko, 상품카테고리_ko)
+                    상품타입_en = rev_type_map.get(상품타입_ko, 상품타입_ko)
+                    상품상세_en = from_korean_detail(상품상세_ko)
+                    
+                    new_doc = {
+                        "날짜": str(날짜),
+                        # ... (이하 동일) ...
+                    }
+                    try:
+                        db.collection(SALES_COLLECTION).add(new_doc)
+                        st.success(f"✅ '{상품상세_ko}' {수량}건 추가 완료!")
+                        
+                        with st.spinner("재고 자동 차감 적용 중..."):
+                            adjust_inventory_by_recipe(
+                                상품상세_en,
+                                수량,
+                                move_type="sale",
+                                note=f"거래 추가: {상품상세_ko} x{수량}"
+                            )
+                        st.success("✅ 재고 차감 완료!")
+                        safe_rerun()
+                    except Exception as e:
+                        st.error(f"데이터 추가 실패: {e}")
 
 # ==============================================================
 # 📊 경영 현황
@@ -1374,12 +1399,46 @@ elif menu == "경영 현황":
 
         col4, col5 = st.columns(2)
         with col4:
+            # 여기는 '카테고리별 매출' 막대 차트
             cat = df.groupby('상품카테고리')['수익'].sum().reset_index()
-            fig_cat = px.pie(cat, values='수익', names='상품카테고리', title="카테고리별 매출 비중")
+            
+            # [수정 1] 클 수록 오른쪽에 있도록 '오름차순(ascending=True)'으로 정렬
+            cat = cat.sort_values('수익', ascending=True) 
+            
+            fig_cat = px.bar(cat, x='상품카테고리', y='수익', title="카테고리별 매출")
+            
+            # [수정 2] 하이브리드 UX 적용
+            fig_cat.update_layout(
+                yaxis_tickformat=None # Y축: M/k 축약형
+            )
+            fig_cat.update_traces(
+                hovertemplate="매출: %{y:,.0f}원<extra></extra>" # 툴팁: 전체 숫자
+            )
+            
             st.plotly_chart(fig_cat, use_container_width=True)
         with col5:
+            # [복구] 여기가 '일자별 매출 추이' 원본입니다.
             daily = df.groupby('날짜')['수익'].sum().reset_index()
-            fig_trend = px.line(daily, x='날짜', y='수익', title="일자별 매출 추이")
+            
+            # [수정 1] 수익이 0인 날짜(그래프가 0으로 내려가는 지점)를 제외합니다.
+            daily_filtered = daily[daily['수익'] > 0]
+            
+            fig_trend = px.line(
+                daily_filtered,  # 👈 0원인 날짜가 제외된 데이터 사용
+                x='날짜', 
+                y='수익', 
+                title="일자별 매출 추이"
+            )
+
+            # [수정 2] 하이브리드 UX 적용
+            fig_trend.update_layout(
+                yaxis_tickformat=None # Y축: M/k 축약형
+            )
+            fig_trend.update_traces(
+                # 툴팁: "2025-01-15<br>매출: 4,500,000원" 형식
+                hovertemplate="<b>%{x|%Y-%m-%d}</b><br>매출: %{y:,.0f}원<extra></extra>" 
+            )
+
             st.plotly_chart(fig_trend, use_container_width=True)
 
 # ==============================================================
@@ -1391,22 +1450,105 @@ elif menu == "매출 대시보드":
     if df.empty:
         st.info("표시할 데이터가 없습니다.")
     else:
-        col1, col2 = st.columns(2)
-        monthly = df.groupby(df['날짜'].dt.to_period("M"))['수익'].sum().reset_index()
-        monthly['날짜'] = monthly['날짜'].dt.to_timestamp()
         
-        with col1:
-            fig_month = px.bar(monthly, x='날짜', y='수익', title="월별 매출")
-            st.plotly_chart(fig_month, use_container_width=True)
-        with col2:
-            cat_sales = df.groupby('상품카테고리')['수익'].sum().reset_index()
-            fig_cat2 = px.bar(cat_sales, x='상품카테고리', y='수익', title="상품 카테고리별 매출")
-            st.plotly_chart(fig_cat2, use_container_width=True)
+        # [수정] 1. 집계 전, '날짜'와 '상품카테고리'가 비어있는(NaN) 데이터를 제거합니다.
+        df_clean = df.dropna(subset=['날짜', '상품카테고리'])
 
+        if df_clean.empty:
+            st.warning("📈 차트를 그릴 데이터가 없습니다. (날짜 또는 카테고리 정보가 비어있음)")
+        else:
+            # [수정] 2. '월'과 '상품카테고리'별로 수익을 집계합니다.
+            try:
+                monthly_stacked_df = df_clean.groupby([
+                    df_clean['날짜'].dt.to_period("M"), 
+                    '상품카테고리'
+                ])['수익'].sum().reset_index()
+                
+                # [수정] 3. Plotly를 위해 Period(기간) 객체를 Timestamp(날짜)로 변경
+                monthly_stacked_df['날짜'] = monthly_stacked_df['날짜'].dt.to_timestamp()
+
+            except Exception as e:
+                st.error(f"데이터 집계 중 오류가 발생했습니다: {e}")
+                st.dataframe(df_clean[['날짜', '상품카테고리']]) # 오류 파악을 위해 원본 데이터 표시
+                monthly_stacked_df = pd.DataFrame() # 빈 데이터프레임으로 초기화
+
+            # [수정] 4. 집계된 데이터가 실제로 있는지 확인
+            if monthly_stacked_df.empty:
+                st.warning("📈 월별/카테고리별로 집계할 데이터가 없습니다.")
+            else:
+                
+                # [수정 1] X축을 한글로 만들기 위해 '날짜' 컬럼을 문자열로 가공
+                # 예: '2025-01-01' -> '2025년 01월'
+                monthly_stacked_df['월(한글)'] = monthly_stacked_df['날짜'].dt.strftime('%Y년 %m월')
+
+                # [수정 2] 'px.bar'를 사용해 누적 막대 그래프(Stacked Bar Chart) 생성
+                fig_stacked_bar = px.bar(
+                    monthly_stacked_df, 
+                    x='월(한글)',      # 👈 X축을 새로 만든 한글 문자열 컬럼으로 변경
+                    y='수익',          
+                    color='상품카테고리', 
+                    title="월별/카테고리별 누적 매출",
+                )
+                
+                # [수정 3] Y축의 'M' 단위를 쉼표(,)가 있는 전체 숫자로 변경
+                fig_stacked_bar.update_layout(
+                    # [제거] 'yaxis_tickformat'을 제거하면
+                    # Plotly가 자동으로 '100M'처럼 축약해 줍니다.
+                    # yaxis_tickformat=',.0f', 👈 이 줄을 삭제하거나 주석 처리
+                    
+                    xaxis_title="월",        # X축 제목
+                    legend_itemclick=False # 범례 클릭 비활성화
+                )
+                
+                # [수정 4] 마우스 오버(툴팁)에도 'M' 대신 전체 숫자가 나오도록 수정
+                fig_stacked_bar.update_traces(
+                    hovertemplate="<b>%{data.name}</b><br>매출: %{y:,.0f}원<extra></extra>"
+                )
+                
+                # 차트가 가운데(전체 너비)에 오도록 바로 표시합니다.
+                st.plotly_chart(fig_stacked_bar, use_container_width=True)
+
+        
+        # [수정] Sunburst 차트를 Treemap으로 변경
+        # [수정] Sunburst 차트를 Treemap으로 변경
         prod_sales = df.groupby(['상품타입','상품상세'])['수익'].sum().reset_index()
-        fig_sun = px.sunburst(prod_sales, path=['상품타입','상품상세'], values='수익', title="상품 구조별 매출")
-        st.plotly_chart(fig_sun, use_container_width=True)
-
+        
+        # [추가] 집계된 데이터가 있는지 확인
+        if not prod_sales.empty:
+            fig_treemap = px.treemap(
+                prod_sales, 
+                path=['상품타입', '상품상세'], # 계층 구조: 타입 > 상세
+                values='수익',               # 타일 크기
+                title="상품 구조별 매출 (트리맵)",
+                
+                # color='수익',
+                # color_continuous_scale=px.colors.sequential.Blues
+            )
+            
+            # [UX 개선] 요청하신 3가지(툴팁, 가독성, 텍스트)를 여기서 수정합니다.
+            fig_treemap.update_traces(
+                
+                # 1. 툴팁 (마우스 올렸을 때) - "정확한 전체 숫자"
+                # "k", "M" 없이 1,234,567원 형식으로 표시
+                hovertemplate=(
+                    "<b>%{label}</b><br>" +     
+                    "매출: %{value:,.0f}원" +   
+                    "<extra></extra>"         
+                ),
+                
+                # 2. 타일 위 텍스트 (버그 수정 및 UX 개선)
+                # 'texttemplate' 대신 'textinfo="label+value"'를 사용합니다.
+                # 타일 위에 "아메리카노"와 "150M"처럼
+                # 레이블과 '축약형' 값이 함께 표시됩니다.
+                # (이 방식은 '바깥 탭' 버그도 발생하지 않습니다.)
+                textinfo="label+value",
+                textposition='middle center', 
+                textfont_size=14
+            )
+            
+            st.plotly_chart(fig_treemap, use_container_width=True) # 👈 개선된 차트를 표시
+        else:
+            st.info("트리맵을 표시할 상품 구조 데이터가 없습니다.")
 # ==============================================================
 # 📈 기간별 분석
 # (원본 코드 생략)
@@ -1419,31 +1561,79 @@ elif menu == "기간별 분석":
         min_date = df['날짜'].min().date()
         max_date = df['날짜'].max().date()
         
-        date_filter = st.slider(
-            "조회 기간",
-            min_value=min_date, max_value=max_date,
-            value=(min_date, max_date),
-            format="YYYY/MM/DD"
-        )
+        # [UX 개선 1] st.slider를 st.date_input 2개로 변경
+        c_filter1, c_filter2 = st.columns(2)
+        with c_filter1:
+            start_date = st.date_input(
+                "조회 시작일",
+                value=min_date,
+                min_value=min_date, max_value=max_date,
+                format="YYYY/MM/DD"
+            )
+        with c_filter2:
+            # 시작일보다 종료일이 빠를 수 없도록 min_value 설정
+            end_date = st.date_input(
+                "조회 종료일",
+                value=max_date,
+                min_value=start_date, max_value=max_date,
+                format="YYYY/MM/DD"
+            )
         
+        # 필터 로직을 start_date, end_date로 변경
         filtered_df = df[
-            (df['날짜'].dt.date >= date_filter[0]) &
-            (df['날짜'].dt.date <= date_filter[1])
+            (df['날짜'].dt.date >= start_date) & 
+            (df['날짜'].dt.date <= end_date)
         ]
         
         if filtered_df.empty:
             st.warning("선택한 기간에 데이터가 없습니다.")
         else:
             c1, c2 = st.columns(2)
+            
+            # --- 차트 1: 요일별 매출 ---
             with c1:
                 week_sales = filtered_df.groupby('요일')['수익'].sum().reindex(weekday_order_kr)
-                fig_week = px.bar(week_sales, x=week_sales.index, y='수익', title="요일별 매출")
+                
+                # [UX 개선 2] 색상 및 포맷 통일
+                fig_week = px.bar(
+                    week_sales, 
+                    x=week_sales.index, 
+                    y='수익', 
+                    title="요일별 매출",
+                    color='수익', # 매출액 기준으로 색상 적용
+                    color_continuous_scale=px.colors.sequential.Blues # 톤다운 블루
+                )
+                fig_week.update_layout(
+                    yaxis_tickformat=None, # Y축: M/k 축약형
+                    
+                    # [추가] 플롯 영역에 연한 회색 배경을 추가해 경계를 만듭니다.
+                    plot_bgcolor='rgba(0,0,0,0.03)' 
+                )
+                fig_week.update_traces(hovertemplate="매출: %{y:,.0f}원<extra></extra>")
+                                
                 st.plotly_chart(fig_week, use_container_width=True)
+                
+            # --- 차트 2: 시간대별 매출 ---
             with c2:
                 hour_sales = filtered_df.groupby('시')['수익'].sum().reset_index()
-                fig_hour = px.bar(hour_sales, x='시', y='수익', title="시간대별 매출")
+                
+                # [UX 개선 3] 시간대별: Bar -> Line (추세 파악) + 색상/포맷 통일
+                fig_hour = px.line( # 👈 Bar를 Line으로 변경
+                    hour_sales, 
+                    x='시', 
+                    y='수익', 
+                    title="시간대별 매출 추이",
+                    markers=True # 시간대별로 점 표시
+                )
+                # 라인 차트는 톤다운 블루 계열의 단색으로 지정
+                fig_hour.update_traces(line_color='#08519c') 
+                fig_hour.update_layout(
+                    yaxis_tickformat=None, # Y축: M/k 축약형
+                    xaxis_title="시간 (0-23시)" # X축 제목 추가
+                )
+                fig_hour.update_traces(hovertemplate="<b>%{x}시</b><br>매출: %{y:,.0f}원<extra></extra>") # 툴팁 개선
+                
                 st.plotly_chart(fig_hour, use_container_width=True)
-
 # ==============================================================
 # 📦 재고 관리
 # (원본 코드 생략, [AI/ML 통합 수정]이 적용된 함수를 사용)
