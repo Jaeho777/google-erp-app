@@ -1379,7 +1379,7 @@ elif menu == "매출 대시보드":
     st.markdown("---")
 
 elif menu == "기간별 분석":
-    _, col_header, col_button = st.columns([0.8, 0.2])
+    _, col_button = st.columns([0.8, 0.2])
     with col_button:
         st.write("") 
         st.button("🏠 홈으로 돌아가기", on_click=set_page, args=("홈",), use_container_width=True)
