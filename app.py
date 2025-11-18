@@ -6,12 +6,10 @@ import pandas as pd
 import os
 from google.cloud import bigquery
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/jaeholee/Desktop/google-erp-app/keys/service-account.json"
+# ❗️[수정] 키 파일 경로 (님이 가진 serviceAccount.json으로)
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/Users/kim-yejun/Desktop/google-erp-app/keys/serviceAccount.json"
 
-# ✅ 서비스 계정 인증
-client = bigquery.Client(location="US")
-
-# ✅ 프로젝트/데이터셋/테이블 정보
+# ✅ [수정] 프로젝트/테이블 정보를 client보다 먼저 정의
 PROJECT_ID = "noted-branch-473510-r5"
 DATASET = "erp_dataset"
 
@@ -20,6 +18,10 @@ SOURCE_TABLE = f"{PROJECT_ID}.{DATASET}.purchase_history1"
 
 # 입력용 테이블 (직접 입력 저장)
 INPUT_TABLE = f"{PROJECT_ID}.{DATASET}.purchase_input"
+
+# ✅ [수정] 서비스 계정 인증 (이제 PROJECT_ID를 알고 있음)
+client = bigquery.Client(project=PROJECT_ID, location="US")
+
 
 # ✅ 페이지 기본 설정
 st.set_page_config(page_title="SnooCat ERP", layout="wide")

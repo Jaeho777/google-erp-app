@@ -7,7 +7,7 @@
 #  - 도움말 탭 + SKU 파라미터(리드타임/세이프티/목표일수/레시피g) + ROP 지표/권장발주
 #  - NEW: 레시피(BOM) 기반 자동 차감, uom(단위) 지원, 실사/오차율, 발주 ±범위 표시
 # ==============================================================
-
+from typing import Union
 import os
 import json
 import re
@@ -381,7 +381,7 @@ def map_series(s: pd.Series, mapping: dict) -> pd.Series:
 # ----------------------
 # ✅ UoM(단위) 유틸
 # ----------------------
-def normalize_uom(u: str | None) -> str:
+def normalize_uom(u: Union[str, None]) -> str:
     u = (u or "ea").strip().lower()
     if u in {"g", "gram", "grams", "그램", "kg", "킬로그램"}:
         return "g"
@@ -621,7 +621,7 @@ def convert_qty(qty: float, from_uom: str, to_uom: str) -> float:
 # (기존) 최소 보장 인벤토리 문서
 # → NEW ensure_inventory_doc로 대체됨
 
-def ensure_inventory_doc(product_detail_en: str, uom: str | None = None, is_ingredient: bool | None = None):
+def ensure_inventory_doc(product_detail_en: str, uom: Union[str, None] = None, is_ingredient: Union[bool, None] = None):
     """인벤토리 문서 보장 + uom/is_ingredient 관리"""
     ref = db.collection(INVENTORY_COLLECTION).document(product_detail_en)
     doc = ref.get()
@@ -815,7 +815,7 @@ def apply_recipe_deduction(menu_sku_en: str, sold_qty: int, commit: bool = True)
         summary.append({"ingredient_en": ing, "used": use_qty, "uom": inv_uom, "before": before, "after": after})
     return summary
 
-def log_stock_move(menu_sku_en: str, qty: int, details: list[dict], move_type: str = "sale", note: str | None = None):
+def log_stock_move(menu_sku_en: str, qty: int, details: list[dict], move_type: str = "sale", note: Union[str, None] = None):
     """재고 이동 로그 기록 (상세는 ingredient 단위)."""
     try:
         db.collection(STOCK_MOVES_COLLECTION).add({
@@ -1085,11 +1085,11 @@ elif menu == "경영 현황":
         with col4:
             cat = df.groupby('상품카테고리')['수익'].sum().reset_index()
             fig_cat = px.pie(cat, values='수익', names='상품카테고리', title="카테고리별 매출 비중")
-            st.plotly_chart(fig_cat, width=W)
+            st.plotly_chart(fig_cat, use_container_width=True)
         with col5:
             daily = df.groupby('날짜')['수익'].sum().reset_index()
             fig_trend = px.line(daily, x='날짜', y='수익', title="일자별 매출 추이")
-            st.plotly_chart(fig_trend, width=W)
+            st.plotly_chart(fig_trend, use_container_width=True)
 
 # ==============================================================
 # 💹 매출 대시보드
@@ -1106,16 +1106,16 @@ elif menu == "매출 대시보드":
 
         with col1:
             fig_month = px.bar(monthly, x='날짜', y='수익', title="월별 매출")
-            st.plotly_chart(fig_month, width=W)
+            st.plotly_chart(fig_month, use_container_width=True)
 
         with col2:
             cat_sales = df.groupby('상품카테고리')['수익'].sum().reset_index()
             fig_cat2 = px.bar(cat_sales, x='상품카테고리', y='수익', title="상품 카테고리별 매출")
-            st.plotly_chart(fig_cat2, width=W)
+            st.plotly_chart(fig_cat2, use_container_width=True)
 
         prod_sales = df.groupby(['상품타입','상품상세'])['수익'].sum().reset_index()
         fig_sun = px.sunburst(prod_sales, path=['상품타입','상품상세'], values='수익', title="상품 구조별 매출")
-        st.plotly_chart(fig_sun, width=W)
+        st.plotly_chart(fig_sun, use_container_width=True)
 
 # ==============================================================
 # 📅 기간별 분석
@@ -1151,12 +1151,12 @@ elif menu == "기간별 분석":
         colA, colB = st.columns(2)
         with colA:
             fig_w = px.bar(df_week, x='요일', y='수익', title="요일별 매출")
-            st.plotly_chart(fig_w, width=W)
+            st.plotly_chart(fig_w, use_container_width=True)
         with colB:
             fig_h = px.line(df_hour, x='시', y='수익', title="시간대별 매출")
-            st.plotly_chart(fig_h, width=W)
+            st.plotly_chart(fig_h, use_container_width=True)
         fig_m = px.bar(df_month, x='월', y='수익', title="월별 매출")
-        st.plotly_chart(fig_m, width=W)
+        st.plotly_chart(fig_m, use_container_width=True)
 
 elif menu == "재고 관리":
 
@@ -1203,10 +1203,10 @@ elif menu == "재고 관리":
                 x='상품상세', y='현재재고', color='재고비율',
                 title="재료별 재고 현황",
             )
-            st.plotly_chart(fig_ing, width=W)
+            st.plotly_chart(fig_ing, use_container_width=True)
             st.caption(f"현재 데이터 크기: {len(df)}행")
             st.dataframe(df.head(1000))  # 전체가 아니라 1000행만 보여주기
-            st.dataframe(df_ing[['상품상세','현재재고','초기재고','uom','재고비율','상태']], width=W)
+            st.dataframe(df_ing[['상품상세','현재재고','초기재고','uom','재고비율','상태']], use_container_width=True)
 
             if not low_ing.empty:
                 st.warning("⚠️ 일부 재료 재고가 15% 이하입니다. 발주를 고려하세요.")
@@ -1277,11 +1277,11 @@ elif menu == "재고 관리":
     else:
         st.caption(f"현재 데이터 크기: {len(df)}행")
         st.dataframe(df.head(1000))  # 전체가 아니라 1000행만 보여주기
-        st.dataframe(df_ing_metrics, width=W)
+        st.dataframe(df_ing_metrics, use_container_width=True)
         need_rows = df_ing_metrics[(df_ing_metrics["상태"].eq("발주요망")) | (df_ing_metrics["권장발주"] > 0)]
         if not need_rows.empty:
             st.warning("⚠️ 아래 재료는 ROP 이하이거나 권장발주량이 존재합니다.")
-            st.dataframe(need_rows[["상품상세","현재재고","uom","ROP","권장발주","lead_time_days","safety_stock_units","target_days"]], width=W)
+            st.dataframe(need_rows[["상품상세","현재재고","uom","ROP","권장발주","lead_time_days","safety_stock_units","target_days"]], use_container_width=True)
 
     st.markdown("---")
 
@@ -1316,7 +1316,7 @@ elif menu == "재고 관리":
         df_moves = pd.DataFrame(move_rows)
         if kw:
             df_moves = df_moves[df_moves.apply(lambda r: kw in str(r.values), axis=1)]
-        st.dataframe(df_moves, hide_index=True, width=W)
+        st.dataframe(df_moves, hide_index=True, use_container_width=True)
     else:
         st.caption("최근 이동 로그가 없습니다.")
 
@@ -1346,7 +1346,7 @@ elif menu == "데이터 편집":
                     "단가": st.column_config.NumberColumn("단가(원)", step=100.0, min_value=0.0),
                     "수익": st.column_config.NumberColumn("수익(원)", step=100.0, min_value=0.0),
                 },
-                width=W,
+                use_container_width=True,
                 key="trx_edit_table"
             )
 
@@ -1438,7 +1438,7 @@ elif menu == "데이터 편집":
                     "초기재고": st.column_config.NumberColumn("초기재고", step=1, min_value=0),
                     "현재재고": st.column_config.NumberColumn("현재재고", step=1, min_value=0),
                 },
-                width=W,
+                use_container_width=True,
                 key="inv_edit_table"
             )
             if st.button("💾 재고 변경 저장"):
@@ -1475,7 +1475,7 @@ elif menu == "거래 내역":
         cols = [c for c in cols if c in df.columns]
         st.caption(f"현재 데이터 크기: {len(df)}행")
         st.dataframe(df.head(1000))  # 전체가 아니라 1000행만 보여주기
-        st.dataframe(df[cols].sort_values('날짜', ascending=False), width=None)
+        st.dataframe(df[cols].sort_values('날짜', ascending=False), use_container_width=True)
 
 
 
