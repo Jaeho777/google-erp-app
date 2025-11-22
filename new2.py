@@ -871,6 +871,61 @@ def call_openai_api(user_prompt: str, data_context: str, model="gpt-3.5-turbo"):
     except Exception as e:
         st.error(f"OpenAI API 호출 중 알 수 없는 오류 발생: {e}")
         return None
+    
+# ==========================================
+# [AI/ML 통합 추가] 영수증 이미지 분석 헬퍼 함수
+# ==========================================
+import base64
+
+def analyze_receipt_image(uploaded_file):
+    """
+    업로드된 영수증 이미지를 GPT-4o(Vision)에게 보내서
+    상호명, 날짜, 시간, 품목 리스트, 총액을 JSON으로 추출합니다.
+    """
+    if not openai.api_key:
+        st.error("OpenAI API 키가 설정되지 않았습니다.")
+        return None
+
+    # 1. 이미지를 Base64로 인코딩
+    bytes_data = uploaded_file.getvalue()
+    base64_image = base64.b64encode(bytes_data).decode('utf-8')
+
+    # 2. 프롬프트 설정 (JSON 형식 강제)
+    system_prompt = """
+    You are a receipt OCR assistant. Analyze the receipt image and extract the following information in JSON format:
+    {
+        "store_name": "Store Name",
+        "date": "YYYY-MM-DD",
+        "time": "HH:MM",
+        "items": [
+            {"name": "Item Name 1", "qty": 1, "price": 1000, "total": 1000},
+            {"name": "Item Name 2", "qty": 2, "price": 2000, "total": 4000}
+        ],
+        "total_amount": 5000
+    }
+    If date/time is missing, use null. Prices should be numbers (remove currency symbols).
+    """
+
+    # 3. API 호출
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o", # 또는 gpt-4-turbo
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Analyze this receipt image and extract data."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]}
+            ],
+            response_format={"type": "json_object"} # JSON 모드 활성화
+        )
+        
+        result_text = response.choices[0].message.content
+        return json.loads(result_text) # 딕셔너리로 변환하여 반환
+
+    except Exception as e:
+        st.error(f"이미지 분석 중 오류 발생: {e}")
+        return None
 
 # SPRINT 2: Prophet 수요 예측 헬퍼
 @st.cache_data(ttl=3600) # 1시간 캐시
@@ -1809,7 +1864,7 @@ elif menu == "재고 관리":
     df_params = load_sku_params()
     
     # [UX 개선] 3중 탭을 2개의 명확한 탭으로 재구성
-    tab1, tab2 = st.tabs(["📊 재료/원가 마스터", "📜 레시피 편집기 (BOM)"])
+    tab1, tab2 , tab3= st.tabs(["📊 재료/원가 마스터", "📜 레시피 편집기 (BOM)", "📸 재고 입력"])
 
     # ==============================================================
     # TAB 1: (신규) 재료/원가 마스터
@@ -1935,7 +1990,7 @@ elif menu == "재고 관리":
                 st.info("변경된 내용이 없습니다.")
 
     # ==============================================================
-    # TAB 2: (신규) 레시피 편집기
+    # TAB 2:  레시피 편집기
     # ==============================================================
     with tab2:
         st.subheader("📜 메뉴별 레시피 (BOM) 편집")
@@ -2053,6 +2108,115 @@ elif menu == "재고 관리":
             st.error(f"AI 재고 리포트 생성 중 오류가 발생했습니다: {e}")
             import traceback
             st.exception(traceback.format_exc())
+    # ==============================================================
+    # TAB 3: (신규) 재고 입력 (영수증 AI)
+    # ==============================================================
+    with tab3:
+        st.subheader("📸 영수증 기반 재고 입고")
+        st.caption("원재료 구매 영수증을 업로드하면 AI가 자동으로 내역을 입력해줍니다.")
+
+        # 세션 상태 초기화 (분석 결과를 저장하기 위함)
+        if "receipt_result" not in st.session_state:
+            st.session_state.receipt_result = None
+
+        # --- [화면 1] 업로드 UI ---
+        # 분석 결과가 없으면 업로드 화면을 보여줌
+        if st.session_state.receipt_result is None:
+            st.markdown("### 영수증 사진 업로드")
+            
+            with st.container(border=True):
+                uploaded_file = st.file_uploader(
+                    "드래그 앤 드롭 또는 클릭하여 파일 선택", 
+                    type=["png", "jpg", "jpeg", "webp"],
+                    help="AI가 영수증 정보를 자동으로 추출해 드립니다."
+                )
+                
+                if uploaded_file is not None:
+                    # 이미지 미리보기
+                    st.image(uploaded_file, caption="업로드된 영수증", width=300)
+                    
+                    if st.button("🤖 AI 분석 시작", type="primary", use_container_width=True):
+                        with st.spinner("AI가 영수증을 읽고 있습니다... (약 5~10초 소요) 🧠"):
+                            # API 호출
+                            data = analyze_receipt_image(uploaded_file)
+                            
+                            if data:
+                                st.session_state.receipt_result = data
+                                st.session_state.receipt_image = uploaded_file # 이미지도 유지
+                                safe_rerun() # 화면 갱신하여 결과 화면으로 이동
+
+        # --- [화면 2] 분석 결과 확인 및 수정 UI ---
+        else:
+            st.markdown("### 📝 데이터 검토 및 수정")
+            
+            data = st.session_state.receipt_result
+            
+            # 상단: 원본 이미지와 헤더 정보
+            col_img, col_info = st.columns([1, 2])
+            
+            with col_img:
+                st.image(st.session_state.receipt_image, caption="원본 이미지", use_container_width=True)
+                if st.button("🔄 다른 영수증 올리기"):
+                    st.session_state.receipt_result = None
+                    st.session_state.receipt_image = None
+                    safe_rerun()
+
+            with col_info:
+                st.markdown("#### 영수증 정보")
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns(3)
+                    # AI가 추출한 정보로 초기값 설정
+                    store_name = c1.text_input("상호명", value=data.get("store_name", ""))
+                    date_val = c2.text_input("거래 날짜", value=data.get("date", ""))
+                    time_val = c3.text_input("거래 시간", value=data.get("time", ""))
+
+            st.markdown("#### 📦 물품 목록")
+            
+            # 품목 리스트를 DataFrame으로 변환
+            items_df = pd.DataFrame(data.get("items", []))
+            
+            # 데이터가 비어있을 경우를 대비해 컬럼 보장
+            if items_df.empty:
+                items_df = pd.DataFrame(columns=["name", "qty", "price", "total"])
+            
+            # Data Editor로 표시 (수정 가능하도록)
+            edited_items = st.data_editor(
+                items_df,
+                column_config={
+                    "name": st.column_config.TextColumn("물품명"),
+                    "qty": st.column_config.NumberColumn("수량", min_value=1),
+                    "price": st.column_config.NumberColumn("단가", format="%d원"),
+                    "total": st.column_config.NumberColumn("총액", format="%d원"),
+                },
+                num_rows="dynamic", # 행 추가/삭제 가능
+                use_container_width=True,
+                key="receipt_editor"
+            )
+
+            # 총액 계산 및 표시
+            st.markdown("---")
+            
+            # 계산된 총액 (Data Editor 수정값 반영)
+            try:
+                calc_total = edited_items["total"].sum()
+            except:
+                calc_total = 0
+                
+            ai_total = data.get("total_amount", 0)
+
+            col_sum1, col_sum2 = st.columns([3, 1])
+            with col_sum2:
+                st.metric("계산된 총액", f"{calc_total:,.0f}원", delta=f"AI 인식 금액: {ai_total:,.0f}원")
+
+            # 하단 버튼 액션 (DB 저장 X)
+            st.markdown("---")
+            btn_col1, btn_col2 = st.columns([1, 4])
+            with btn_col2:
+                # [요청사항 준수] 버튼을 눌러도 아무 일도 일어나지 않음 (Print만 함)
+                if st.button("💾 DB에 저장 (재고 반영)", type="primary", use_container_width=True):
+                    st.toast("✅ (시뮬레이션) 데이터가 확인되었습니다! (현재 DB 저장 기능은 비활성화 상태입니다)")
+                    # 여기에 나중에 firebase 저장 코드를 넣으면 됩니다.
+    
 
 # =============================================================
 # 🤖 AI 비서 (SPRINT 1)
