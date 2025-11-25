@@ -1759,331 +1759,101 @@ if menu == "거래 추가":
 # ==============================================================
 # 📊 통합 경영 현황 (경영 현황 + 매출 대시보드 통합)
 # ==============================================================
-# ==============================================================
-# 📊 통합 경영 현황 (경영 현황 + 매출 대시보드 통합) - 수정됨
-# ==============================================================
-# ==============================================================
-# 📊 통합 경영 현황 (경영 현황 + 매출 대시보드 통합) - 수정됨 (Fix KeyError)
-# ==============================================================
-# ==============================================================
-# 📊 통합 경영 현황 (KeyError 해결: CSS 중괄호 Escape {{ }})
-# ==============================================================
 elif menu == "경영 현황":
     # 1. 상단 네비게이션
-    col_header, col_btn = st.columns([0.85, 0.15])
-    with col_header:
-        st.header("📊 통합 경영 대시보드")
-    # with col_btn:
-    #     st.button("🏠 홈으로", on_click=set_page, args=("홈",), use_container_width=True, key="btn_dashboard_home_final")
+    _, col_button = st.columns([0.8, 0.2])
+    with col_button:
+        st.write("") 
+        # 👇 [수정] key="btn_home_dashboard" 추가
+        st.button("🏠 홈으로 돌아가기", on_click=set_page, args=("홈",), use_container_width=True, key="btn_home_dashboard")
+    
+    st.header("📊 통합 경영 대시보드")
 
     if df.empty:
         st.info("표시할 데이터가 없습니다.")
     else:
-        # -------------------------------------------------------
-        # [전처리] 데이터 라벨링 (강제 치환)
-        # -------------------------------------------------------
-        df_dashboard = df.copy()
-        
-        df_dashboard['상품카테고리'] = df_dashboard['상품카테고리'].astype(str).str.strip().replace('nan', '기타')
-        df_dashboard['상품상세'] = df_dashboard['상품상세'].astype(str).str.strip().replace('nan', '미지정')
-
-        rename_map = {
-            "Coffee": "원두/에스프레소", 
-            "커피": "원두/에스프레소",
-            "Branded": "MD/기획상품",
-            "branded": "MD/기획상품",
-            "Tea": "차(Tea)",
-            "Bakery": "베이커리",
-            "Packaged Chocolate": "초콜릿/스낵",
-            "Loose Tea": "잎차"
-        }
-        
-        df_dashboard['상품카테고리'] = df_dashboard['상품카테고리'].replace(rename_map)
-        df_dashboard['상품상세'] = df_dashboard['상품상세'].replace(rename_map)
-        # -------------------------------------------------------
-
         # --- [SECTION 1] 핵심 KPI 카드 ---
-        total_revenue = df_dashboard['수익'].sum()
-        total_sales_count = df_dashboard.shape[0]
+        total_revenue = df['수익'].sum()
+        total_sales_count = df.shape[0]
         avg_revenue_per_sale = total_revenue / total_sales_count if total_sales_count > 0 else 0
         
-        # [중요] CSS 중괄호를 {{ }}로 변경하여 .format() 충돌 방지
-        st.markdown("""
-        <style>
-        .metric-container {{
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 30px;
-        }}
-        .metric-card {{
-            background-color: #ffffff;
-            border: 1px solid #e0e0e0;
-            border-radius: 12px;
-            padding: 24px 20px;
-            text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-        }}
-        .metric-title {{
-            font-size: 1.3rem;
-            font-weight: 600;
-            color: #555;
-            margin-bottom: 12px;
-        }}
-        .metric-value {{
-            font-size: 2.5rem;
-            font-weight: 800;
-            color: #004aad;
-            line-height: 1.2;
-        }}
-        </style>
-
-        <div class="metric-container">
-            <div class="metric-card">
-                <div class="metric-title">💰 총 매출</div>
-                <div class="metric-value">{total_revenue}</div>
+        st.markdown(f"""
+            <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; margin-bottom:20px;">
+                <div class="metric-card">
+                    <div class="metric-title">총 매출</div>
+                    <div class="metric-value">{format_krw(total_revenue)}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">총 판매 건수</div>
+                    <div class="metric-value">{total_sales_count:,} 건</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-title">건당 평균 매출</div>
+                    <div class="metric-value">{format_krw(avg_revenue_per_sale)}</div>
+                </div>
             </div>
-            <div class="metric-card">
-                <div class="metric-title">🧾 총 판매 건수</div>
-                <div class="metric-value">{total_count}</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-title">💳 건당 평균 매출</div>
-                <div class="metric-value">{avg_revenue}</div>
-            </div>
-        </div>
-        """.format(
-            total_revenue=format_krw(total_revenue),
-            total_count=f"{total_sales_count:,}",
-            avg_revenue=format_krw(avg_revenue_per_sale)
-        ), unsafe_allow_html=True)
+            """, unsafe_allow_html=True)
 
         # --- [SECTION 2] 최고 인기 상품 정보 ---
         try:
-            top_cat = df_dashboard.groupby('상품카테고리')['수익'].sum().sort_values(ascending=False).head(1)
-            top_prod = df_dashboard.groupby('상품타입')['수익'].sum().sort_values(ascending=False).head(1)
+            top_cat = df.groupby('상품카테고리')['수익'].sum().sort_values(ascending=False).head(1)
+            top_prod = df.groupby('상품타입')['수익'].sum().sort_values(ascending=False).head(1)
             st.info(f"🏆 **매출 1위 카테고리**: {top_cat.index[0]} ({format_krw(top_cat.iloc[0])})  |  🏆 **매출 1위 타입**: {top_prod.index[0]}")
         except Exception:
             pass
 
         st.markdown("---")
 
-        # --- [SECTION 3] 차트 영역 ---
+        # --- [SECTION 3] 상세 차트 (스크롤 형식) ---
         st.subheader("📈 매출 추이 분석")
         col_t1, col_t2 = st.columns(2)
         
         # 1. 일자별 매출 추이
         with col_t1:
-            st.markdown("#### 📅 일자별 매출 흐름")
-            
-            daily = df_dashboard.groupby('날짜')['수익'].sum().reset_index()
+            daily = df.groupby('날짜')['수익'].sum().reset_index()
             daily_filtered = daily[daily['수익'] > 0]
-            
-            if not daily_filtered.empty:
-                st.markdown("""
-                <div style="margin-bottom: 10px; padding: 10px; border-radius: 8px; background-color: rgba(255,255,255,0.05);">
-                    <span style="font-size: 0.85rem; color: #E0E0E0;">
-                        ℹ️ <b>Tip:</b> 🔴 <b>빨간 점</b>은 최고 매출일을 의미합니다.
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
+            fig_trend = px.line(daily_filtered, x='날짜', y='수익', title="📅 일자별 매출 추이")
+            fig_trend.update_layout(yaxis_tickformat=None, hovermode="x unified")
+            fig_trend.update_traces(hovertemplate="매출: %{y:,.0f}원")
+            st.plotly_chart(fig_trend, use_container_width=True)
 
-                max_row = daily_filtered.loc[daily_filtered['수익'].idxmax()]
-                max_date = max_row['날짜']
-                max_val = max_row['수익']
-                avg_val = daily_filtered['수익'].mean()
-
-                fig_trend = px.line(daily_filtered, x='날짜', y='수익', title=None)
-                fig_trend.update_traces(
-                    line_color='#1E88E5', 
-                    fill='tozeroy',
-                    fillcolor='rgba(30, 136, 229, 0.1)',
-                    hovertemplate="<b>%{x|%Y년 %m월 %d일}</b><br>매출: %{y:,.0f}원<extra></extra>"
-                )
-
-                fig_trend.add_scatter(
-                    x=[max_date], y=[max_val],
-                    mode='markers+text',
-                    marker=dict(color='red', size=10, symbol='star'),
-                    text=[f"🏆최고: {format_krw(max_val)}"],
-                    textposition="top center",
-                    name='최고 매출'
-                )
-
-                fig_trend.add_shape(
-                    type="line",
-                    x0=daily_filtered['날짜'].min(), y0=avg_val,
-                    x1=daily_filtered['날짜'].max(), y1=avg_val,
-                    line=dict(color="gray", width=2, dash="dot"),
-                )
-                fig_trend.add_annotation(
-                    x=daily_filtered['날짜'].max(), y=avg_val,
-                    text=f"평균: {format_krw(avg_val)}",
-                    showarrow=False,
-                    yshift=10, xshift=-30,
-                    font=dict(color="gray", size=11)
-                )
-
-                fig_trend.update_layout(
-                    yaxis_tickformat=',.0f', 
-                    yaxis_ticksuffix='원',   
-                    xaxis_tickformat='%Y년 %m월 %d일',
-                    hovermode="x unified",
-                    showlegend=False,
-                    margin=dict(t=20, l=10, r=10, b=10),
-                    height=350
-                )
-                st.plotly_chart(fig_trend, use_container_width=True)
-            else:
-                st.info("일자별 데이터가 없습니다.")
-
-        # 2. 월별/카테고리별 누적 매출 (그라데이션 + 기타 회색)
-       # 2. 월별/카테고리별 누적 매출 (진한색 아래 배치 + 기타 최상단 + 툴팁)
+        # 2. 월별/카테고리별 누적 매출
         with col_t2:
-            st.markdown("#### 📊 월별 카테고리 누적 매출 (시간순)")
-            
-            df_clean = df_dashboard.dropna(subset=['날짜', '상품카테고리'])
+            df_clean = df.dropna(subset=['날짜', '상품카테고리'])
             if not df_clean.empty:
-                # [1] 순서 및 색상 로직 정의
-                # '기타'를 제외한 나머지 카테고리를 매출 높은 순(내림차순)으로 정렬
-                df_no_etc = df_clean[df_clean['상품카테고리'] != '기타']
-                cat_revenue_rank = df_no_etc.groupby('상품카테고리')['수익'].sum().sort_values(ascending=False).index.tolist()
-                
-                # [중요] '기타'는 맨 마지막(그래프의 최상단)에 오도록 리스트 맨 뒤에 추가
-                if '기타' in df_clean['상품카테고리'].unique():
-                    cat_revenue_rank.append('기타')
-
-                # [2] 색상 매핑 (진한 파랑 -> 연한 파랑, 기타=회색)
-                blues = px.colors.sequential.Blues_r  # 진한색부터 시작
-                
-                # 색상 개수 맞추기 (기타 제외한 개수만큼)
-                rank_len = len(cat_revenue_rank) - (1 if '기타' in cat_revenue_rank else 0)
-                if rank_len > len(blues):
-                    colors = blues * (rank_len // len(blues) + 1)
-                else:
-                    colors = blues
-
-                # 딕셔너리로 매핑
-                color_map_monthly = {cat: color for cat, color in zip(cat_revenue_rank, colors)}
-                color_map_monthly['기타'] = '#E0E0E0' # 기타는 회색 고정
-
-                # [3] 데이터 집계
                 monthly_stacked_df = df_clean.groupby([
                     df_clean['날짜'].dt.to_period("M"), '상품카테고리'
                 ])['수익'].sum().reset_index()
                 monthly_stacked_df['날짜'] = monthly_stacked_df['날짜'].dt.to_timestamp()
                 monthly_stacked_df['월(한글)'] = monthly_stacked_df['날짜'].dt.strftime('%Y년 %m월')
 
-                # 날짜 정렬
-                monthly_stacked_df = monthly_stacked_df.sort_values(['날짜', '상품카테고리'], ascending=[True, True])
-                
-                # 전월 대비 증감률 계산
-                pct_change = monthly_stacked_df.groupby('상품카테고리')['수익'].pct_change().fillna(0) * 100
-                monthly_stacked_df['전월대비'] = pct_change.round(0).astype(int)
-
-                # [Tip 상단]
-                st.markdown("""
-                <div style="margin-bottom: 10px; padding: 10px; border-radius: 8px; background-color: rgba(255,255,255,0.05);">
-                    <span style="font-size: 0.85rem; color: #E0E0E0;">
-                        ℹ️ <b>Tip:</b> <b>아래쪽(진한 색)일수록 매출 비중이 큰 효자 상품</b>입니다.<br>
-                        (마우스를 올리시면 전월 대비 증감률을 보실 수 있습니다.)
-                    </span>
-                </div>
-                """, unsafe_allow_html=True)
-
                 fig_stacked = px.bar(
                     monthly_stacked_df, x='월(한글)', y='수익', color='상품카테고리',
-                    title=None, 
-                    custom_data=['전월대비'],
-                    # [핵심] category_orders를 통해 '매출 높은 순'이 '아래쪽'부터 쌓이게 설정
-                    category_orders={'상품카테고리': cat_revenue_rank},
-                    color_discrete_map=color_map_monthly
+                    title="📊 월별 카테고리 누적 매출"
                 )
-                
-                fig_stacked.update_layout(
-                    yaxis_tickformat=',.0f', 
-                    yaxis_ticksuffix='원',
-                    xaxis_title="월", 
-                    # xaxis 정렬 고정
-                    xaxis={'categoryorder': 'array', 'categoryarray': sorted(monthly_stacked_df['월(한글)'].unique())},
-                    margin=dict(t=20, l=10, r=10, b=10),
-                    height=350
-                )
-                
-                # 툴팁 설정
-                fig_stacked.update_traces(hovertemplate="<b>%{data.name}</b><br>매출: %{y:,.0f}원<br>전월대비: %{customdata[0]:+d}%<extra></extra>")
+                fig_stacked.update_layout(yaxis_tickformat=None, xaxis_title="월", legend_title_text=None)
+                fig_stacked.update_traces(hovertemplate="<b>%{data.name}</b><br>매출: %{y:,.0f}원<extra></extra>")
                 st.plotly_chart(fig_stacked, use_container_width=True)
             else:
                 st.info("월별 데이터를 집계할 수 없습니다.")
 
         st.markdown("---")
-
-        # [ROW 2] 상품 및 카테고리 분석
-        st.subheader("🛍 상품 및 카테고리 분석")
-        col_p1, col_p2 = st.columns([0.65, 0.35]) 
+        
+        # --- [SECTION 4] 상품/카테고리 분석 ---
+        st.subheader("🛍 상품/카테고리 분석")
+        col_p1, col_p2 = st.columns([0.6, 0.4])
 
         # 3. 상품 구조별 매출 트리맵
         with col_p1:
-            df_tree = df_dashboard.copy()
-
-            def assign_color_group(row):
-                full_text = f"{row['상품카테고리']} {row['상품타입']} {row['상품상세']}".lower()
-                blue_keywords = ['커피', '차', 'coffee', 'tea', 'beverage', 'drink', 'latte', 'espresso', 'americano', '아메리카노', '라떼', '원두']
-                
-                if any(k in full_text for k in blue_keywords):
-                    return "커피/음료 (Blue)"
-                else:
-                    return "베이커리/MD (Orange)"
-
-            df_tree['색상그룹'] = df_tree.apply(assign_color_group, axis=1)
-
-            prod_sales = df_tree.groupby(['색상그룹', '상품카테고리', '상품상세'])['수익'].sum().reset_index()
-            
+            prod_sales = df.groupby(['상품타입','상품상세'])['수익'].sum().reset_index()
             if not prod_sales.empty:
-                simple_color_map = {
-                    "커피/음료 (Blue)": "#90CAF9", 
-                    "베이커리/MD (Orange)": "#FFAB91"
-                }
-
-                st.markdown("""
-                <div style="margin-bottom: 15px; padding: 15px; border-radius: 12px; background-color: rgba(255,255,255,0.05);">
-                    <div style="font-size: 1rem; font-weight: 700; color: #FFFFFF; margin-bottom: 8px;">
-                        🔲 상품 구조별 매출 (트리맵)
-                    </div>
-                    <div style="display: flex; gap: 15px; align-items: center; margin-bottom: 8px;">
-                        <div style="display: flex; align-items: center;">
-                            <span style="width: 10px; height: 10px; background-color: #90CAF9; border-radius: 3px; margin-right: 6px;"></span>
-                            <span style="font-size: 0.85rem; color: #FFFFFF; font-weight: 500;">커피/음료</span>
-                        </div>
-                        <div style="display: flex; align-items: center;">
-                            <span style="width: 10px; height: 10px; background-color: #FFAB91; border-radius: 3px; margin-right: 6px;"></span>
-                            <span style="font-size: 0.85rem; color: #FFFFFF; font-weight: 500;">베이커리/MD</span>
-                        </div>
-                    </div>
-                    <div style="font-size: 0.8rem; color: #CCCCCC;">
-                        • <b>박스 크기</b> = <b>매출액</b> (클릭하여 확대)
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
                 fig_treemap = px.treemap(
-                    prod_sales, 
-                    path=['상품카테고리', '상품상세'], 
-                    values='수익',
-                    color='색상그룹', 
-                    color_discrete_map=simple_color_map
+                    prod_sales, path=['상품타입', '상품상세'], values='수익',
+                    title="🔲 상품 구조별 매출 (트리맵)"
                 )
-                
-                fig_treemap.update_layout(
-                    height=500,
-                    margin=dict(t=0, l=0, r=0, b=0)
-                )
-
                 fig_treemap.update_traces(
                     hovertemplate="<b>%{label}</b><br>매출: %{value:,.0f}원<extra></extra>",
-                    textinfo="label+value", 
-                    textposition='middle center', 
-                    textfont_size=14
+                    textinfo="label+value", textposition='middle center', textfont_size=14
                 )
                 st.plotly_chart(fig_treemap, use_container_width=True)
             else:
@@ -2091,30 +1861,11 @@ elif menu == "경영 현황":
 
         # 4. 카테고리별 매출 바 차트
         with col_p2:
-            st.markdown("#### 🏆 카테고리별 매출 순위") 
-            
-            cat_sales = df_dashboard.groupby('상품카테고리')['수익'].sum().reset_index().sort_values('수익', ascending=True)
-            
-            fig_cat = px.bar(cat_sales, x='수익', y='상품카테고리', orientation='h', title=None)
-            
-            fig_cat.update_layout(
-                xaxis_tickformat=',.0f',
-                xaxis_ticksuffix='원',
-                yaxis_title=None,
-                margin=dict(t=10, l=10, r=10, b=10),
-                height=400
-            )
+            cat_sales = df.groupby('상품카테고리')['수익'].sum().reset_index().sort_values('수익', ascending=True)
+            fig_cat = px.bar(cat_sales, x='수익', y='상품카테고리', orientation='h', title="🏆 카테고리별 매출 순위")
+            fig_cat.update_layout(xaxis_tickformat=None)
             fig_cat.update_traces(hovertemplate="매출: %{x:,.0f}원<extra></extra>")
             st.plotly_chart(fig_cat, use_container_width=True)
-
-            # st.markdown("""
-            # <div style="margin-top: 10px; padding: 10px; border-radius: 8px; background-color: rgba(255,255,255,0.05);">
-            #     <span style="font-size: 0.85rem; color: #E0E0E0;">
-            #         ℹ️ <b>Tip:</b> 우리 가게 <b>효자 카테고리</b> 순위입니다.<br>
-            #         (막대가 길수록 매출 기여도가 높습니다)
-            #     </span>
-            # </div>
-            # """, unsafe_allow_html=True)
 # ==============================================================
 # 📈 기간별 분석
 # (원본 코드 생략)
