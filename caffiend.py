@@ -16,6 +16,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.io as pio
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import textwrap
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -1072,6 +1075,61 @@ def call_openai_api(user_prompt: str, data_context: str, model="gpt-3.5-turbo"):
     except Exception as e:
         st.error(f"OpenAI API 호출 중 알 수 없는 오류 발생: {e}")
         return None
+    
+# ==========================================
+# [AI/ML 통합 추가] 영수증 이미지 분석 헬퍼 함수
+# ==========================================
+import base64
+
+def analyze_receipt_image(uploaded_file):
+    """
+    업로드된 영수증 이미지를 GPT-4o(Vision)에게 보내서
+    상호명, 날짜, 시간, 품목 리스트, 총액을 JSON으로 추출합니다.
+    """
+    if not openai.api_key:
+        st.error("OpenAI API 키가 설정되지 않았습니다.")
+        return None
+
+    # 1. 이미지를 Base64로 인코딩
+    bytes_data = uploaded_file.getvalue()
+    base64_image = base64.b64encode(bytes_data).decode('utf-8')
+
+    # 2. 프롬프트 설정 (JSON 형식 강제)
+    system_prompt = """
+    You are a receipt OCR assistant. Analyze the receipt image and extract the following information in JSON format:
+    {
+        "store_name": "Store Name",
+        "date": "YYYY-MM-DD",
+        "time": "HH:MM",
+        "items": [
+            {"name": "Item Name 1", "qty": 1, "price": 1000, "total": 1000},
+            {"name": "Item Name 2", "qty": 2, "price": 2000, "total": 4000}
+        ],
+        "total_amount": 5000
+    }
+    If date/time is missing, use null. Prices should be numbers (remove currency symbols).
+    """
+
+    # 3. API 호출
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4o", # 또는 gpt-4-turbo
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Analyze this receipt image and extract data."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                ]}
+            ],
+            response_format={"type": "json_object"} # JSON 모드 활성화
+        )
+        
+        result_text = response.choices[0].message.content
+        return json.loads(result_text) # 딕셔너리로 변환하여 반환
+
+    except Exception as e:
+        st.error(f"이미지 분석 중 오류 발생: {e}")
+        return None
 
 # SPRINT 2: Prophet 수요 예측 헬퍼
 @st.cache_data(ttl=3600) # 1시간 캐시
@@ -1941,86 +1999,343 @@ elif menu == "매출 대시보드":
 # (원본 코드 생략)
 # ==============================================================
 elif menu == "기간별 분석":
+    # -----------------------------------------------------------
+    # 📈 기간별 분석 (React UI 포팅 버전)
+    # -----------------------------------------------------------
     st.header("📈 기간별 분석")
+    
     if df.empty:
         st.info("표시할 데이터가 없습니다.")
     else:
-        min_date = df['날짜'].min().date()
-        max_date = df['날짜'].max().date()
+        # [0] 날짜 필터 상태 관리 (세션 스테이트 사용)
+        # 앱이 리로드되어도 날짜 설정이 유지되도록 합니다.
+        if 'anl_start_date' not in st.session_state:
+            st.session_state.anl_start_date = df['날짜'].max().date() - pd.Timedelta(days=29) # 기본 1개월
+        if 'anl_end_date' not in st.session_state:
+            st.session_state.anl_end_date = df['날짜'].max().date()
+
+        # [1] 상단 컨트롤 패널 (날짜 선택 + 퀵 버튼 + KPI 카드)
+        # React의 레이아웃: 좌측(날짜 컨트롤) / 우측(매출 요약)
         
-        # [UX 개선 1] st.slider를 st.date_input 2개로 변경
-        c_filter1, c_filter2 = st.columns(2)
-        with c_filter1:
-            start_date = st.date_input(
-                "조회 시작일",
-                value=min_date,
-                min_value=min_date, max_value=max_date,
-                format="YYYY/MM/DD"
-            )
-        with c_filter2:
-            # 시작일보다 종료일이 빠를 수 없도록 min_value 설정
-            end_date = st.date_input(
-                "조회 종료일",
-                value=max_date,
-                min_value=start_date, max_value=max_date,
-                format="YYYY/MM/DD"
-            )
-        
-        # 필터 로직을 start_date, end_date로 변경
-        filtered_df = df[
-            (df['날짜'].dt.date >= start_date) & 
-            (df['날짜'].dt.date <= end_date)
-        ]
-        
-        if filtered_df.empty:
-            st.warning("선택한 기간에 데이터가 없습니다.")
-        else:
-            c1, c2 = st.columns(2)
-            
-            # --- 차트 1: 요일별 매출 ---
-            with c1:
-                week_sales = filtered_df.groupby('요일')['수익'].sum().reindex(weekday_order_kr)
+        # 전체를 감싸는 컨테이너 스타일
+        st.markdown("""
+        <style>
+        .control-panel {
+            background-color: white;
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+            margin-bottom: 24px;
+        }
+        .metric-box {
+            padding: 16px 20px;
+            border-radius: 12px;
+            border: 1px solid;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            color: #1e293b;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        with st.container():
+            col_ctrl, col_kpi = st.columns([1, 1.2])
+
+            # --- 좌측: 날짜 선택 및 퀵 버튼 ---
+            with col_ctrl:
+                st.markdown("### 📅 조회 기간 설정")
                 
-                # [UX 개선 2] 색상 및 포맷 통일
-                fig_week = px.bar(
-                    week_sales, 
-                    x=week_sales.index, 
-                    y='수익', 
-                    title="요일별 매출",
-                    color='수익', # 매출액 기준으로 색상 적용
-                    color_continuous_scale=px.colors.sequential.Blues # 톤다운 블루
-                )
-                fig_week.update_layout(
-                    yaxis_tickformat=None, # Y축: M/k 축약형
+                # 퀵 버튼 로직
+                def set_period(days):
+                    end = df['날짜'].max().date() # 기준은 데이터의 가장 최근 날짜
+                    start = end - pd.Timedelta(days=days - 1) # inclusive 계산 (7일이면 오늘 포함 7일전)
+                    st.session_state.anl_start_date = start
+                    st.session_state.anl_end_date = end
+
+                # 퀵 버튼 UI
+                b_col1, b_col2, b_col3, _ = st.columns([1, 1, 1, 2])
+                if b_col1.button("1주일"): set_period(7); safe_rerun()
+                if b_col2.button("1개월"): set_period(30); safe_rerun()
+                if b_col3.button("3개월"): set_period(90); safe_rerun()
+
+                # 날짜 선택기 (세션 스테이트와 연동)
+                c_d1, c_d2 = st.columns(2)
+                new_start = c_d1.date_input("시작일", value=st.session_state.anl_start_date, max_value=df['날짜'].max().date())
+                new_end = c_d2.date_input("종료일", value=st.session_state.anl_end_date, min_value=new_start, max_value=df['날짜'].max().date())
+                
+                # 수동 변경 감지 시 업데이트
+                if new_start != st.session_state.anl_start_date or new_end != st.session_state.anl_end_date:
+                    st.session_state.anl_start_date = new_start
+                    st.session_state.anl_end_date = new_end
+                    safe_rerun()
+
+            # --- 데이터 필터링 ---
+            # 선택된 날짜로 데이터 필터링
+            mask = (df['날짜'].dt.date >= st.session_state.anl_start_date) & (df['날짜'].dt.date <= st.session_state.anl_end_date)
+            filtered_df = df[mask]
+            
+            # --- 우측: KPI 카드 (총 매출 & 비교 분석) ---
+            with col_kpi:
+                if filtered_df.empty:
+                    st.warning("선택한 기간에 데이터가 없습니다.")
+                    total_revenue = 0
+                    diff_revenue = 0
+                    duration_days = 0
+                    percent_change = 0
+                else:
+                    # 1. 현재 기간 매출
+                    total_revenue = filtered_df['수익'].sum()
+
+                    # 2. 직전 기간 매출 비교 로직
+                    start_date = pd.to_datetime(st.session_state.anl_start_date)
+                    end_date = pd.to_datetime(st.session_state.anl_end_date)
+
+                    # 기간 일수 계산 (inclusive)
+                    duration_days = (end_date - start_date).days + 1
+
+                    # 직전 기간 계산
+                    prev_end = start_date - pd.Timedelta(days=1)
+                    prev_start = prev_end - pd.Timedelta(days=duration_days - 1)
+
+                    prev_mask = (df['날짜'] >= prev_start) & (df['날짜'] <= prev_end)
+                    prev_revenue = df[prev_mask]['수익'].sum()
+
+                    # 👉 이전 기간 매출이 0이면 '비교 불가' 상태로 처리
+                    if prev_revenue == 0:
+                        diff_revenue = 0
+                        compare_label = f"지난 {duration_days}일 대비"
+                        diff_text = "이전 기간 데이터 없음"
+                        is_comparable = False
+                    else:
+                        diff_revenue = total_revenue - prev_revenue
+                        compare_label = f"지난 {duration_days}일 대비"
+                        diff_text = f"{abs(diff_revenue):,.0f}원"
+                        is_comparable = True
+
                     
-                    # [추가] 플롯 영역에 연한 회색 배경을 추가해 경계를 만듭니다.
-                    plot_bgcolor='rgba(0,0,0,0.03)' 
+                    # HTML/CSS로 KPI 카드 렌더링 (React 디자인 포팅)
+                    # 색상 결정
+                    if diff_revenue > 0:
+                        bg_color = "linear-gradient(135deg, #ecfdf5 0%, #ffffff 100%)" # Emerald-50
+                        border_color = "#d1fae5" # Emerald-100
+                        text_color = "#059669" # Emerald-600
+                        icon = "▲"
+                    elif diff_revenue < 0:
+                        bg_color = "linear-gradient(135deg, #fff1f2 0%, #ffffff 100%)" # Rose-50
+                        border_color = "#ffe4e6" # Rose-100
+                        text_color = "#e11d48" # Rose-600
+                        icon = "▼"
+                    else:
+                        bg_color = "#f8fafc"
+                        border_color = "#e2e8f0"
+                        text_color = "#64748b"
+                        icon = "-"
+                    
+                    st.markdown(
+                            f"""<div style="display: flex; gap: 16px; margin-top: 10px;">
+                        <!-- 총 매출 카드 -->
+                        <div style="flex: 1; background: linear-gradient(135deg, #eff6ff 0%, #ffffff 100%); border: 1px solid #dbeafe; border-radius: 12px; padding: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+                            <div style="color: #2563eb; font-weight: 700; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">총 매출</div>
+                            <div style="display: flex; align-items: baseline; gap: 4px;">
+                            <span style="font-size: 2.2rem; font-weight: 800; color: #0f172a;">{total_revenue:,.0f}</span>
+                            <span style="font-size: 1.2rem; font-weight: 700; color: #64748b;">원</span>
+                            </div>
+                        </div>
+
+                        <!-- 비교 카드 -->
+                        <div style="flex: 1; background: {bg_color}; border: 1px solid {border_color}; border-radius: 12px; padding: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">
+                            <div style="display: flex; align-items: center; justify-content: space-between;">
+                            <div style="color: {text_color}; font-weight: 700; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px;">지난 {duration_days}일 대비</div>
+                            <div style="background-color: {text_color}20; color: {text_color}; padding: 2px 6px; border-radius: 99px; font-size: 0.75rem; font-weight: bold;">{icon}</div>
+                            </div>
+                            <div style="display: flex; align-items: baseline; gap: 4px;">
+                            <span style="font-size: 1.8rem; font-weight: 800; color: #0f172a;">{abs(diff_revenue):,.0f}</span>
+                            <span style="font-size: 1.0rem; font-weight: 700; color: #64748b;">원</span>
+                            </div>
+                        </div>
+                        </div>""",
+                            unsafe_allow_html=True,
+                        )
+
+
+            
+        st.markdown("---")
+
+        if not filtered_df.empty:
+            c_chart1, c_chart2 = st.columns(2)
+            
+            # -----------------------------------------------------------
+            # [Chart 1] 요일별 매출 (WeeklyChart.tsx 포팅)
+            # -----------------------------------------------------------
+            with c_chart1:
+                st.subheader("📊 요일별 매출")
+                
+                # 금요일 주말 포함 토글
+                col_head, col_tog = st.columns([2, 1])
+                with col_tog:
+                    include_friday = st.toggle("금요일 주말 포함", value=True)
+                
+                # 데이터 집계
+                week_sales = filtered_df.groupby('요일')['수익'].sum().reindex(weekday_order_kr).fillna(0)
+                
+                # 색상 결정 로직
+                colors = []
+                for day in week_sales.index:
+                    if day in ['토', '일']:
+                        colors.append('#f97316') # 주말 (Orange)
+                    elif day == '금' and include_friday:
+                        colors.append('#f97316') # 금요일 주말 포함 시
+                    else:
+                        colors.append('#3b82f6') # 평일 (Blue)
+
+                # Y축 최소값 계산 (10만 단위 내림)
+                min_rev = week_sales[week_sales > 0].min() if not week_sales[week_sales > 0].empty else 0
+                max_rev = week_sales.max()
+                y_min = (min_rev // 100000) * 100000
+                y_max = max_rev * 1.1 # 여유 공간
+
+                # Plotly GO 사용 (세밀한 제어)
+                fig_week = go.Figure()
+                fig_week.add_trace(go.Bar(
+                    x=week_sales.index,
+                    y=week_sales.values,
+                    marker_color=colors,
+                    hovertemplate='<b>%{x}요일</b><br>매출: %{y:,.0f}원<extra></extra>'
+                ))
+                
+                fig_week.update_layout(
+                    yaxis=dict(
+                        range=[y_min, y_max],
+                        tickformat=',.0f', # '만' 단위 처리는 텍스트 대체가 복잡하므로 콤마 포맷 사용
+                        title=None
+                    ),
+                    xaxis=dict(title=None),
+                    plot_bgcolor='rgba(0,0,0,0.02)',
+                    margin=dict(t=10, b=0, l=0, r=0),
+                    showlegend=False,
+                    height=350
                 )
-                fig_week.update_traces(hovertemplate="매출: %{y:,.0f}원<extra></extra>")
-                                
+                
                 st.plotly_chart(fig_week, use_container_width=True)
                 
-            # --- 차트 2: 시간대별 매출 ---
-            with c2:
-                hour_sales = filtered_df.groupby('시')['수익'].sum().reset_index()
+                # 범례 (HTML)
+                st.markdown("""
+                <div style="display: flex; justify-content: center; gap: 16px; margin-top: -10px; font-size: 0.8rem; color: #64748b;">
+                    <div style="display: flex; align-items: center; gap: 4px;"><span style="width: 10px; height: 10px; background-color: #3b82f6; border-radius: 50%;"></span> 평일</div>
+                    <div style="display: flex; align-items: center; gap: 4px;"><span style="width: 10px; height: 10px; background-color: #f97316; border-radius: 50%;"></span> 주말</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # -----------------------------------------------------------
+            # [Chart 2] 시간대별 매출 추이 (HourlyChart.tsx 포팅)
+            # -----------------------------------------------------------
+            with c_chart2:
+                st.subheader("⏰ 시간대별 매출 추이 (이상 감지)")
                 
-                # [UX 개선 3] 시간대별: Bar -> Line (추세 파악) + 색상/포맷 통일
-                fig_hour = px.line( # 👈 Bar를 Line으로 변경
-                    hour_sales, 
-                    x='시', 
-                    y='수익', 
-                    title="시간대별 매출 추이",
-                    markers=True # 시간대별로 점 표시
+                # 영업 시간 설정 필터
+                h_c1, h_c2 = st.columns(2)
+                with h_c1:
+                    start_h = st.selectbox("영업 시작", range(0, 24), index=9)
+                with h_c2:
+                    end_h = st.selectbox("영업 종료", range(0, 24), index=22)
+                
+                if start_h > end_h:
+                    st.error("시작 시간이 종료 시간보다 늦을 수 없습니다.")
+                    end_h = start_h
+                
+                # 데이터 집계
+                hourly_sales = filtered_df.groupby('시')['수익'].sum().reindex(range(24)).fillna(0).reset_index()
+                
+                # 필터링
+                hourly_sales = hourly_sales[(hourly_sales['시'] >= start_h) & (hourly_sales['시'] <= end_h)]
+                
+                # 통계 계산 (평균, 주의, 위험)
+                non_zero = hourly_sales[hourly_sales['수익'] > 0]['수익']
+
+                if not non_zero.empty:
+                    mean_val = non_zero.mean()
+                else:
+                    mean_val = 0
+
+                warning_val = mean_val * 0.6
+                critical_val = mean_val * 0.3
+                
+                # 색상 결정 로직 (점 색상)
+                point_colors = []
+                for val in hourly_sales['수익']:
+                    if val < critical_val:
+                        point_colors.append('#ef4444') # Red (저조)
+                    elif val < warning_val:
+                        point_colors.append('#eab308') # Yellow (주의)
+                    else:
+                        point_colors.append('#08519c') # Blue (정상)
+
+                # 그라디언트 라인 시뮬레이션 (Marker + Line)
+                fig_hour = go.Figure()
+                
+                # 1. 연결 선 (기본 회색/파란색 톤)
+                fig_hour.add_trace(go.Scatter(
+                    x=hourly_sales['시'],
+                    y=hourly_sales['수익'],
+                    mode='lines',
+                    line=dict(color='#cbd5e1', width=2), # 기본 선은 연하게
+                    hoverinfo='skip'
+                ))
+                
+                # 2. 데이터 포인트 (상태별 색상)
+                fig_hour.add_trace(go.Scatter(
+                    x=hourly_sales['시'],
+                    y=hourly_sales['수익'],
+                    mode='markers',
+                    marker=dict(
+                        color=point_colors,
+                        size=8,
+                        line=dict(color='white', width=1)
+                    ),
+                    hovertemplate='<b>%{x}시</b><br>매출: %{y:,.0f}원<extra></extra>'
+                ))
+                
+                # 3. 평균선 (Reference Line)
+                fig_hour.add_shape(
+                    type="line",
+                    x0=start_h, x1=end_h,
+                    y0=mean_val, y1=mean_val,
+                    line=dict(color="#94a3b8", width=1, dash="dash"),
                 )
-                # 라인 차트는 톤다운 블루 계열의 단색으로 지정
-                fig_hour.update_traces(line_color='#08519c') 
+                fig_hour.add_annotation(
+                    x=end_h, y=mean_val,
+                    text="평균",
+                    showarrow=False,
+                    yshift=10,
+                    font=dict(size=10, color="#64748b")
+                )
+
                 fig_hour.update_layout(
-                    yaxis_tickformat=None, # Y축: M/k 축약형
-                    xaxis_title="시간 (0-23시)" # X축 제목 추가
+                    yaxis=dict(
+                        tickformat=',.0f',
+                        title=None
+                    ),
+                    xaxis=dict(
+                        title="시간 (시)",
+                        tickmode='linear',
+                        dtick=2 if (end_h - start_h) > 12 else 1
+                    ),
+                    plot_bgcolor='white',
+                    margin=dict(t=10, b=0, l=0, r=0),
+                    showlegend=False,
+                    height=350
                 )
-                fig_hour.update_traces(hovertemplate="<b>%{x}시</b><br>매출: %{y:,.0f}원<extra></extra>") # 툴팁 개선
                 
                 st.plotly_chart(fig_hour, use_container_width=True)
+                
+                # 범례 (HTML)
+                st.markdown("""
+                <div style="display: flex; justify-content: center; gap: 12px; margin-top: -10px; font-size: 0.75rem; color: #64748b;">
+                    <div style="display: flex; align-items: center; gap: 4px;"><span style="width: 8px; height: 8px; background-color: #08519c; border-radius: 50%;"></span> 정상</div>
+                    <div style="display: flex; align-items: center; gap: 4px;"><span style="width: 8px; height: 8px; background-color: #eab308; border-radius: 50%;"></span> 주의 (<60%)</div>
+                    <div style="display: flex; align-items: center; gap: 4px;"><span style="width: 8px; height: 8px; background-color: #ef4444; border-radius: 50%;"></span> 저조 (<30%)</div>
+                </div>
+                """, unsafe_allow_html=True)
 # ==============================================================
 # 📦 재고 관리
 # (원본 코드 생략, [AI/ML 통합 수정]이 적용된 함수를 사용)
@@ -2036,7 +2351,7 @@ elif menu == "재고 관리":
     df_params = load_sku_params()
     
     # [UX 개선] 3중 탭을 2개의 명확한 탭으로 재구성
-    tab1, tab2 = st.tabs(["📊 재료/원가 마스터", "📜 레시피 편집기 (BOM)"])
+    tab1, tab2 , tab3= st.tabs(["📊 재료/원가 마스터", "📜 레시피 편집기 (BOM)", "📸 재고 입력"])
 
     # ==============================================================
     # TAB 1: (신규) 재료/원가 마스터
@@ -2291,6 +2606,116 @@ elif menu == "재고 관리":
             st.error(f"AI 재고 리포트 생성 중 오류가 발생했습니다: {e}")
             import traceback
             st.exception(traceback.format_exc())
+
+    # ==============================================================
+    # TAB 3: (신규) 재고 입력 (영수증 AI)
+    # ==============================================================
+    with tab3:
+        st.subheader("📸 영수증 기반 재고 입고")
+        st.caption("원재료 구매 영수증을 업로드하면 AI가 자동으로 내역을 입력해줍니다.")
+
+        # 세션 상태 초기화 (분석 결과를 저장하기 위함)
+        if "receipt_result" not in st.session_state:
+            st.session_state.receipt_result = None
+
+        # --- [화면 1] 업로드 UI ---
+        # 분석 결과가 없으면 업로드 화면을 보여줌
+        if st.session_state.receipt_result is None:
+            st.markdown("### 영수증 사진 업로드")
+            
+            with st.container(border=True):
+                uploaded_file = st.file_uploader(
+                    "드래그 앤 드롭 또는 클릭하여 파일 선택", 
+                    type=["png", "jpg", "jpeg", "webp"],
+                    help="AI가 영수증 정보를 자동으로 추출해 드립니다."
+                )
+                
+                if uploaded_file is not None:
+                    # 이미지 미리보기
+                    st.image(uploaded_file, caption="업로드된 영수증", width=300)
+                    
+                    if st.button("🤖 AI 분석 시작", type="primary", use_container_width=True):
+                        with st.spinner("AI가 영수증을 읽고 있습니다... (약 5~10초 소요) 🧠"):
+                            # API 호출
+                            data = analyze_receipt_image(uploaded_file)
+                            
+                            if data:
+                                st.session_state.receipt_result = data
+                                st.session_state.receipt_image = uploaded_file # 이미지도 유지
+                                safe_rerun() # 화면 갱신하여 결과 화면으로 이동
+
+        # --- [화면 2] 분석 결과 확인 및 수정 UI ---
+        else:
+            st.markdown("### 📝 데이터 검토 및 수정")
+            
+            data = st.session_state.receipt_result
+            
+            # 상단: 원본 이미지와 헤더 정보
+            col_img, col_info = st.columns([1, 2])
+            
+            with col_img:
+                st.image(st.session_state.receipt_image, caption="원본 이미지", use_container_width=True)
+                if st.button("🔄 다른 영수증 올리기"):
+                    st.session_state.receipt_result = None
+                    st.session_state.receipt_image = None
+                    safe_rerun()
+
+            with col_info:
+                st.markdown("#### 영수증 정보")
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns(3)
+                    # AI가 추출한 정보로 초기값 설정
+                    store_name = c1.text_input("상호명", value=data.get("store_name", ""))
+                    date_val = c2.text_input("거래 날짜", value=data.get("date", ""))
+                    time_val = c3.text_input("거래 시간", value=data.get("time", ""))
+
+            st.markdown("#### 📦 물품 목록")
+            
+            # 품목 리스트를 DataFrame으로 변환
+            items_df = pd.DataFrame(data.get("items", []))
+            
+            # 데이터가 비어있을 경우를 대비해 컬럼 보장
+            if items_df.empty:
+                items_df = pd.DataFrame(columns=["name", "qty", "price", "total"])
+            
+            # Data Editor로 표시 (수정 가능하도록)
+            edited_items = st.data_editor(
+                items_df,
+                column_config={
+                    "name": st.column_config.TextColumn("물품명"),
+                    "qty": st.column_config.NumberColumn("수량", min_value=1),
+                    "price": st.column_config.NumberColumn("단가", format="%d원"),
+                    "total": st.column_config.NumberColumn("총액", format="%d원"),
+                },
+                num_rows="dynamic", # 행 추가/삭제 가능
+                use_container_width=True,
+                key="receipt_editor"
+            )
+
+            # 총액 계산 및 표시
+            st.markdown("---")
+            
+            # 계산된 총액 (Data Editor 수정값 반영)
+            try:
+                calc_total = edited_items["total"].sum()
+            except:
+                calc_total = 0
+                
+            ai_total = data.get("total_amount", 0)
+
+            col_sum1, col_sum2 = st.columns([3, 1])
+            with col_sum2:
+                st.metric("계산된 총액", f"{calc_total:,.0f}원", delta=f"AI 인식 금액: {ai_total:,.0f}원")
+
+            # 하단 버튼 액션 (DB 저장 X)
+            st.markdown("---")
+            btn_col1, btn_col2 = st.columns([1, 4])
+            with btn_col2:
+                # [요청사항 준수] 버튼을 눌러도 아무 일도 일어나지 않음 (Print만 함)
+                if st.button("💾 DB에 저장 (재고 반영)", type="primary", use_container_width=True):
+                    st.toast("✅ (시뮬레이션) 데이터가 확인되었습니다! (현재 DB 저장 기능은 비활성화 상태입니다)")
+                    # 여기에 나중에 firebase 저장 코드를 넣으면 됩니다.
+    
 
 # =============================================================
 # 🤖 AI 비서 (SPRINT 1)
