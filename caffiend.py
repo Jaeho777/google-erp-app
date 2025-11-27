@@ -7,6 +7,7 @@ import os
 import json
 import re
 import warnings
+import math
 from math import ceil
 from pathlib import Path
 from datetime import datetime
@@ -55,6 +56,91 @@ def safe_rerun():
         pass
 # ===================================================================
 
+# UX/비즈니스 로직에 필요한 상수/도우미
+SUPPLY_MODES = ["쿠팡/네이버 주문", "거래처 도매 발주", "전화/직접 방문"]
+DEFAULT_SUPPLY_MODE = SUPPLY_MODES[0]
+DEFAULT_SUPPLY_LEAD_DAYS = 2
+DEFAULT_GRAMS_PER_CUP = 15.0  # g 단위 재고를 잔(컵)으로 환산할 때 사용
+
+HOLIDAYS_FIXED = {
+    "01-01": "신정", "03-01": "삼일절", "05-05": "어린이날", "06-06": "현충일",
+    "08-15": "광복절", "10-03": "개천절", "10-09": "한글날", "12-25": "성탄절",
+}
+
+def is_holiday_date(d) -> bool:
+    try:
+        return d.strftime("%m-%d") in HOLIDAYS_FIXED
+    except Exception:
+        return False
+
+def format_date_with_holiday(d) -> str:
+    """요일+공휴일 표시 문자열 생성."""
+    try:
+        weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][d.weekday()]
+    except Exception:
+        return str(d)
+    holiday_name = HOLIDAYS_FIXED.get(d.strftime("%m-%d"))
+    suffix = f" ({weekday_kr})"
+    if holiday_name:
+        suffix += f" 공휴일"
+    return f"{d.isoformat()}{suffix}"
+
+
+def parse_currency_input(raw: str) -> float:
+    """쉼표/원 단위를 제거하고 숫자(float) 반환."""
+    if raw is None:
+        return 0.0
+    s = str(raw).replace(",", "").replace("원", "").strip()
+    if s == "":
+        return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def render_currency_input(label: str, value: float, key: str):
+    """텍스트 입력으로 통화 입력 UX 제공 (쉼표 자동 포맷)."""
+    formatted_default = f"{int(value):,}" if value is not None else ""
+    typed = st.text_input(label, value=formatted_default, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
+    cleaned_val = parse_currency_input(typed)
+    pretty = f"{int(cleaned_val):,}원" if cleaned_val else "0원"
+    st.caption(f"입력값: {pretty}")
+    return cleaned_val
+
+
+def choose_option(label: str, options: list[str], key: str, placeholder: str | None = None):
+    """옵션이 3개 이하인 경우 버튼/라디오로, 그 외에는 selectbox 사용."""
+    if not options:
+        return None
+    if len(options) <= 3:
+        return st.radio(label, options, key=key, horizontal=True, label_visibility="visible")
+    return st.selectbox(label, options, key=key, index=None, placeholder=placeholder)
+
+
+def get_recent_sales_entries(df_source: pd.DataFrame, limit: int = 3):
+    """최근 거래 N건을 단순히 조회하는 헬퍼 (UI/재사용용)."""
+    if df_source is None or df_source.empty:
+        return []
+    try:
+        df_recent = df_source.dropna(subset=["상품상세"]).copy()
+        if not pd.api.types.is_datetime64_any_dtype(df_recent.get("날짜")):
+            df_recent["날짜"] = pd.to_datetime(df_recent["날짜"], errors="coerce")
+        df_recent = df_recent.dropna(subset=["날짜"])
+        df_recent = df_recent.sort_values("날짜", ascending=False).head(limit)
+        rows = []
+        for _, row in df_recent.iterrows():
+            rows.append({
+                "상품상세": row.get("상품상세"),
+                "상품카테고리": row.get("상품카테고리"),
+                "상품타입": row.get("상품타입"),
+                "단가": safe_float(row.get("단가", row.get("price", 0))),
+                "수량": int(safe_float(row.get("수량", 1), 1)),
+                "날짜": pd.to_datetime(row.get("날짜")).date() if pd.notna(row.get("날짜")) else datetime.now().date(),
+            })
+        return rows
+    except Exception:
+        return []
 
 st.set_page_config(page_title="☕ Coffee ERP Dashboard", layout="wide")
 
@@ -304,6 +390,14 @@ def convert_qty(qty: float, from_uom: str, to_uom: str) -> float:
         return float(qty)
     return float(qty)
 
+def convert_stock_to_cups(qty: float, uom: str, grams_per_cup: float = DEFAULT_GRAMS_PER_CUP) -> float:
+    """g 단위를 잔(컵) 기준으로 환산."""
+    if normalize_uom(uom) != "g":
+        return float(qty)
+    if grams_per_cup <= 0:
+        return float(qty)
+    return float(qty) / grams_per_cup
+
 def safe_float(x, default=0.0):
     if x is None:
         return default
@@ -351,6 +445,45 @@ def parse_mixed_dates(series: pd.Series) -> pd.Series:
             warnings.simplefilter("ignore", UserWarning)
             out.loc[remain] = pd.to_datetime(s.loc[remain], errors='coerce')
     return out
+
+
+def estimate_ingredient_daily_usage(df_sales: pd.DataFrame, recipes: dict, days: int = 30) -> dict:
+    """최근 N일간 판매+레시피 기반 재료별 일평균 소진량 계산."""
+    if df_sales is None or df_sales.empty or not recipes:
+        return {}
+    df_use = df_sales.copy()
+    if not pd.api.types.is_datetime64_any_dtype(df_use.get("날짜")):
+        try:
+            df_use["날짜"] = pd.to_datetime(df_use["날짜"], errors="coerce")
+        except Exception:
+            return {}
+    df_use = df_use.dropna(subset=["날짜"])
+    if df_use.empty:
+        return {}
+    cutoff = df_use["날짜"].max() - pd.Timedelta(days=days - 1)
+    df_use = df_use[df_use["날짜"] >= cutoff]
+    if df_use.empty:
+        return {}
+
+    usage_map: dict[str, float] = {}
+    for _, row in df_use.iterrows():
+        try:
+            qty = safe_float(row.get("수량", 1), 1)
+            menu_en = from_korean_detail(row.get("상품상세"))
+            ingredients = recipes.get(menu_en, [])
+            for item in ingredients:
+                base_qty = safe_float(item.get("qty", 0.0), 0.0)
+                waste_pct = safe_float(item.get("waste_pct", 0.0), 0.0)
+                total_used = (base_qty * qty) * (1 + (waste_pct / 100.0))
+                sku = item.get("ingredient_en")
+                if not sku:
+                    continue
+                usage_map[sku] = usage_map.get(sku, 0.0) + total_used
+        except Exception:
+            continue
+
+    days_span = max((df_use["날짜"].max() - df_use["날짜"].min()).days + 1, 1)
+    return {k: v / days_span for k, v in usage_map.items()}
 
 # ----------------------
 # 1️⃣ CSV 로드 (샘플 생성 없음)
@@ -685,13 +818,18 @@ def load_inventory_df() -> pd.DataFrame:
             # [L4] 원가 컬럼 추가
             "cost_unit_size": cost_unit_size, # 매입 단위 (e.g., 1000)
             "cost_per_unit": cost_per_unit,  # 매입가 (e.g., 30000)
-            "unit_cost": unit_cost           # 1g/ml/ea당 원가 (e.g., 30)
+            "unit_cost": unit_cost,           # 1g/ml/ea당 원가 (e.g., 30)
+
+            # 공급 방식/리드타임 (UX 개선)
+            "supply_mode": doc.get("supply_mode", DEFAULT_SUPPLY_MODE),
+            "supply_lead_days": safe_float(doc.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS)),
         })
     
     # === [빈틈 수정] inventory가 비어있어도 컬럼은 유지 ===
     df = pd.DataFrame(rows, columns=[
         "상품상세_en", "상품상세", "초기재고", "현재재고", "uom", "is_ingredient",
-        "cost_unit_size", "cost_per_unit", "unit_cost" # [L4]
+        "cost_unit_size", "cost_per_unit", "unit_cost",
+        "supply_mode", "supply_lead_days" # 공급 정보
     ])
     return df
 
@@ -713,7 +851,8 @@ def load_sku_params() -> pd.DataFrame:
     dfp = pd.DataFrame(rows)
     if dfp.empty:
         dfp = pd.DataFrame(columns=[
-            "_id","sku_en","lead_time_days","safety_stock_units","target_days","grams_per_cup","expiry_days"
+            "_id","sku_en","lead_time_days","safety_stock_units","target_days","grams_per_cup","expiry_days",
+            "supply_mode","supply_lead_days"
         ])
     defaults = {
         "lead_time_days": 3,
@@ -721,12 +860,17 @@ def load_sku_params() -> pd.DataFrame:
         "target_days": 21,
         "grams_per_cup": 18.0,
         "expiry_days": 28,
+        "supply_mode": DEFAULT_SUPPLY_MODE,
+        "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
     }
     for col, default in defaults.items():
         if col not in dfp.columns:
             dfp[col] = default
         else:
-            dfp[col] = pd.to_numeric(dfp[col], errors="coerce").fillna(default)
+            if isinstance(default, str):
+                dfp[col] = dfp[col].fillna(default)
+            else:
+                dfp[col] = pd.to_numeric(dfp[col], errors="coerce").fillna(default)
     return dfp
 
 # --- 3. 헬퍼 함수 정의 (정의 3: Ensure Inventory Doc) ---
@@ -754,6 +898,8 @@ def ensure_inventory_doc(product_detail_en: str, uom: str = "ea", is_ingredient:
             "cost_unit_size": 1.0,
             "cost_per_unit": 0.0,
             "unit_cost": 0.0,
+            "supply_mode": DEFAULT_SUPPLY_MODE,
+            "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
         })
         return ref
 
@@ -1464,8 +1610,11 @@ def find_profit_insights(df_with_margin: pd.DataFrame):
 # 1. 모든 메뉴 옵션 정의
 # 1. 모든 메뉴 옵션 정의
 MENU_OPTIONS = [
-    "홈", "경영 현황", "매출 대시보드", "기간별 분석", "거래 추가", 
-    "재고 관리", "AI 비서", "데이터 편집", "거래 내역", "연구 검증", "도움말"
+    "홈",
+    # 상단 노출 우선순위
+    "경영 현황", "기간별 분석", "거래 추가", "재고 관리", "AI 비서",
+    # 그 외 보조 기능
+    "매출 대시보드", "거래 내역", "데이터 편집", "연구 검증", "도움말"
 ]
 
 # 2. 세션 상태 초기화 (앱 실행 시 '홈'으로 설정)
@@ -1518,39 +1667,45 @@ if menu == "홈":
     </style>
     """, unsafe_allow_html=True)
 
-    # 메뉴 아이템 정의 (아이콘, 이름, 설명)
-    menu_items = {
+    # 메뉴 아이템 정의 (우선순위 그룹 + 보조 기능)
+    top_menus = {
         "경영 현황": ("📈", "전체 경영 현황 확인"),
-        "매출 대시보드": ("📊", "매출 데이터 분석"),
         "기간별 분석": ("📅", "기간별 데이터 분석"),
-        "거래 추가": ("➕", "새로운 거래 등록"),
-        "재고 관리": ("📦", "재고 현황 관리"),
-        "AI 비서": ("🤖", "AI 기반 업무 지원"),
-        "데이터 편집": ("✏️", "데이터 수정 및 관리"),
+        "거래 추가": ("➕", "반복 거래를 빠르게 등록"),
+        "재고 관리": ("📦", "재고/발주 핵심 정보"),
+        "AI 비서": ("🤖", "AI 기반 브리핑"),
+    }
+    secondary_menus = {
+        "매출 대시보드": ("📊", "세부 매출 분석"),
         "거래 내역": ("🧾", "거래 이력 조회"),
+        "데이터 편집": ("✏️", "데이터 수정 및 관리"),
         "연구 검증": ("🔬", "데이터 검증 및 연구"),
         "도움말": ("❓", "사용 가이드 및 지원"),
     }
-    
-    menu_keys = list(menu_items.keys())
-    
-    # 5x2 그리드 생성
-    for i in range(0, len(menu_keys), 5):
-        cols = st.columns(5)
-        current_row_keys = menu_keys[i:i+5]
-        
-        for col_index, key in enumerate(current_row_keys):
-            icon, desc = menu_items[key]
-            
-            with cols[col_index].container(border=True):
-                # [핵심] 버튼을 누르면 set_page 함수가 호출됨
+
+    # 상단 5개 메뉴 (한 줄)
+    cols = st.columns(len(top_menus))
+    for idx, (key, (icon, desc)) in enumerate(top_menus.items()):
+        with cols[idx].container(border=True):
+            st.button(
+                label=f"{icon} {key}",
+                on_click=set_page,
+                args=(key,),
+                use_container_width=True,
+            )
+            st.markdown(f"<div class='home-desc'>{desc}</div>", unsafe_allow_html=True)
+
+    # 보조 메뉴는 접어서 노출
+    with st.expander("🔧 추가 기능", expanded=False):
+        cols2 = st.columns(len(secondary_menus))
+        for idx, (key, (icon, desc)) in enumerate(secondary_menus.items()):
+            with cols2[idx].container(border=True):
                 st.button(
                     label=f"{icon} {key}",
                     on_click=set_page,
-                    args=(key,), # 👈 This is the page name to pass to set_page
+                    args=(key,),
                     use_container_width=True,
                 )
-                # 버튼 아래에 설명 추가
                 st.markdown(f"<div class='home-desc'>{desc}</div>", unsafe_allow_html=True)
 
 # ==============================================================
@@ -1643,106 +1798,165 @@ elif menu == "도움말":
 if menu == "거래 추가":
     st.header(" 거래 데이터 추가")
     
-    # [수정] st.form을 제거하고, 종속형 메뉴를 순서대로 배치합니다.
-    df_order = df[df['상품상세'].isin(SEED_MENUS)].copy()
+    today = datetime.now().date()
+    if "prefill_order" not in st.session_state:
+        st.session_state.prefill_order = None
+        st.session_state.prefill_from_history = False
+
+    df_order = df.copy()
     if df_order.empty:
-        # df에 데이터가 없을 때도 시드 메뉴 5종을 선택할 수 있게 더미 데이터 생성
         st.info("주문 가능한 메뉴가 없어서 시드 메뉴 5종을 임시로 채웠습니다.")
         df_order = pd.DataFrame({
             "상품상세": SEED_MENUS,
             "상품상세_en": [from_korean_detail(m) for m in SEED_MENUS],
             "상품카테고리": ["기타"] * len(SEED_MENUS),
             "상품타입": ["기타"] * len(SEED_MENUS),
-            "단가": [5000.0] * len(SEED_MENUS),  # 기본 단가
+            "단가": [5000.0] * len(SEED_MENUS),
             "수량": [1] * len(SEED_MENUS),
             "수익": [5000.0] * len(SEED_MENUS),
             "날짜": [pd.Timestamp.now()] * len(SEED_MENUS),
         })
-    category_options = sorted(pd.Series(df_order['상품카테고리']).dropna().unique().tolist())
-    
-    # --- 1. 카테고리 선택 ---
-    상품카테고리_ko = st.selectbox("1. 상품카테고리 선택", category_options, index=None, placeholder="카테고리를 선택하세요...")
 
-    # --- 2. 타입 선택 (카테고리에 따라 필터링) ---
-    if 상품카테고리_ko:
-        df_filtered_type = df_order[df_order['상품카테고리'] == 상품카테고리_ko]
-        type_options = sorted(pd.Series(df_filtered_type['상품타입']).dropna().unique().tolist())
-        
-        상품타입_ko = st.selectbox("2. 상품타입 선택", type_options, index=None, placeholder="상품타입을 선택하세요...")
+    # 최근 입력 3건 카드
+    recent_cards = get_recent_sales_entries(df_order, limit=3)
 
-        # --- 3. 상세 메뉴 선택 (타입에 따라 필터링) ---
-        if 상품타입_ko:
-            df_filtered_detail = df_filtered_type[df_filtered_type['상품타입'] == 상품타입_ko]
-            detail_options = sorted(pd.Series(df_filtered_detail['상품상세']).dropna().unique().tolist())
-            
-            상품상세_ko = st.selectbox("3. 상품상세 선택", detail_options, index=None, placeholder="상세 메뉴를 선택하세요...")
-
-            # --- 4. 수량 및 단가 입력 (메뉴가 확정된 후) ---
-            if 상품상세_ko:
-                
-                # [UX 개선 2] 선택한 메뉴의 '최근 단가'를 자동으로 불러옵니다.
-                try:
-                    # df에서 이 메뉴의 가장 마지막(최근) '단가'를 찾아 제안
-                    last_price = df[df['상품상세'] == 상품상세_ko]['단가'].iloc[-1]
-                    last_price = float(last_price)
-                except Exception:
-                    last_price = 1000.0 # 못찾으면 기본값
-
-                st.markdown("---")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    수량 = st.number_input("수량", min_value=1, value=1)
-                with col2:
-                    단가 = st.number_input(
-                        "단가(원)", 
-                        min_value=0.0, 
-                        value=last_price, # 👈 자동으로 찾은 최근 단가를 제안
-                        step=100.0
-                    )
-                
-                날짜 = st.date_input("날짜", value=datetime.now().date())
-                
-                수익 = 수량 * 단가
-                st.markdown(f"### 💰 계산된 수익: **{format_krw(수익)}**")
-                
-                # [수정] st.form_submit_button 대신 st.button 사용
-                submitted = st.button("데이터 추가")
-                
-                if submitted:
-                    # ... (이하 데이터 저장 로직은 동일) ...
-                    상품카테고리_en = rev_category_map.get(상품카테고리_ko, 상품카테고리_ko)
-                    상품타입_en = rev_type_map.get(상품타입_ko, 상품타입_ko)
-                    상품상세_en = from_korean_detail(상품상세_ko)
-                    
-                    new_doc = {
-                        "날짜": str(날짜),
-                        "상품상세": 상품상세_en,
-                        "상품상세_ko": 상품상세_ko,
-                        "상품카테고리": 상품카테고리_en,
-                        "상품타입": 상품타입_en,
-                        "수량": 수량,
-                        "단가": 단가,
-                        "수익": 수익,
-                        "가게위치": "Firebase",
-                        "가게ID": "LOCAL",
-                        "시간": datetime.now().strftime("%H:%M:%S"),
-                    }
-                    try:
-                        db.collection(SALES_COLLECTION).add(new_doc)
-                        st.success(f"✅ '{상품상세_ko}' {수량}건 추가 완료!")
-                        
-                        with st.spinner("재고 자동 차감 적용 중..."):
-                            adjust_inventory_by_recipe(
-                                상품상세_en,
-                                수량,
-                                move_type="sale",
-                                note=f"거래 추가: {상품상세_ko} x{수량}"
-                            )
-                        st.success("✅ 재고 차감 완료!")
+    if recent_cards:
+        st.subheader("🕑 최근 입력한 거래 (클릭 한 번으로 불러오기)")
+        cols = st.columns(len(recent_cards))
+        for idx, item in enumerate(recent_cards):
+            with cols[idx].container(border=True):
+                st.markdown(f"**{item['상품상세']}**")
+                date_txt = format_date_with_holiday(item['날짜'])
+                if is_holiday_date(item['날짜']):
+                    st.caption(f":red[{date_txt}]")
+                else:
+                    st.caption(date_txt)
+                st.caption(f"{item['상품카테고리']} · {item['상품타입']}")
+                st.caption(f"{int(item['단가']):,}원 / {item['수량']}개")
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("불러오기", key=f"load_recent_{idx}", use_container_width=True):
+                        st.session_state.prefill_order = item
+                        st.session_state.prefill_from_history = True
                         safe_rerun()
-                    except Exception as e:
-                        st.error(f"데이터 추가 실패: {e}")
+                with c2:
+                    if st.button("바로 추가", key=f"quick_add_{idx}", use_container_width=True):
+                        try:
+                            doc = {
+                                "날짜": str(today),
+                                "상품상세": from_korean_detail(item["상품상세"]),
+                                "상품상세_ko": item["상품상세"],
+                                "상품카테고리": rev_category_map.get(item["상품카테고리"], item["상품카테고리"]),
+                                "상품타입": rev_type_map.get(item["상품타입"], item["상품타입"]),
+                                "수량": item["수량"],
+                                "단가": item["단가"],
+                                "수익": item["수량"] * item["단가"],
+                                "가게위치": "Firebase",
+                                "가게ID": "LOCAL",
+                                "시간": datetime.now().strftime("%H:%M:%S"),
+                            }
+                            db.collection(SALES_COLLECTION).add(doc)
+                            adjust_inventory_by_recipe(doc["상품상세"], doc["수량"], move_type="sale_quick", note="히스토리 바로 추가")
+                            load_all_core_data.clear(); load_inventory_df.clear()
+                            st.success("✅ 바로 추가 완료")
+                            safe_rerun()
+                        except Exception as e:
+                            st.error(f"바로 추가 실패: {e}")
+        st.divider()
+
+    prefill = st.session_state.prefill_order or {}
+    # 선택값 자동 반영
+    if prefill:
+        st.session_state.setdefault("order_cat", prefill.get("상품카테고리"))
+        st.session_state.setdefault("order_detail", prefill.get("상품상세"))
+        st.session_state.setdefault("order_price_input", f"{int(prefill.get('단가', 0)):,}")
+    category_options = sorted(pd.Series(df_order['상품카테고리']).dropna().unique().tolist())
+    if prefill.get("상품카테고리") and prefill["상품카테고리"] not in category_options:
+        category_options.append(prefill["상품카테고리"])
+    상품카테고리_ko = choose_option("1. 상품카테고리 선택", category_options, key="order_cat", placeholder="카테고리를 선택하세요...")
+
+    if 상품카테고리_ko:
+        df_filtered_cat = df_order[df_order['상품카테고리'] == 상품카테고리_ko]
+        detail_options = sorted(pd.Series(df_filtered_cat['상품상세']).dropna().unique().tolist())
+        if prefill.get("상품상세") and prefill["상품상세"] not in detail_options:
+            detail_options.append(prefill["상품상세"])
+        상품상세_ko = choose_option("2. 메뉴 선택", detail_options, key="order_detail", placeholder="메뉴를 선택하세요...")
+        if prefill and 상품상세_ko != prefill.get("상품상세"):
+            st.session_state.prefill_from_history = False
+
+        if 상품상세_ko:
+            # 타입은 자동 추론 (최근 거래 기준)
+            try:
+                recent_type = df_filtered_cat[df_filtered_cat['상품상세'] == 상품상세_ko]['상품타입'].iloc[-1]
+            except Exception:
+                recent_type = df_filtered_cat['상품타입'].mode().iloc[0] if not df_filtered_cat.empty else "기타"
+
+            try:
+                last_price = df[df['상품상세'] == 상품상세_ko]['단가'].iloc[-1]
+                last_price = float(last_price)
+            except Exception:
+                last_price = 1000.0
+            default_price = prefill.get("단가", last_price)
+            default_qty = int(prefill.get("수량", 1))
+
+            st.markdown("---")
+            col1, col2 = st.columns(2)
+            with col1:
+                수량 = st.number_input("수량", min_value=1, value=default_qty)
+            with col2:
+                단가 = render_currency_input("단가(원)", value=default_price, key="order_price_input")
+            
+            날짜 = st.date_input("날짜", value=today, format="YYYY-MM-DD")
+            date_txt = format_date_with_holiday(날짜)
+            if is_holiday_date(날짜):
+                st.caption(f":red[{date_txt}]")
+            else:
+                st.caption(date_txt)
+
+            수익 = 수량 * 단가
+            st.markdown(f"### 💰 계산된 수익: **{format_krw(수익)}**")
+            
+            submitted = st.button("🟢 저장하기", use_container_width=True)
+            
+            if submitted:
+                st.session_state.prefill_from_history = st.session_state.prefill_from_history and bool(prefill)
+                상품카테고리_en = rev_category_map.get(상품카테고리_ko, 상품카테고리_ko)
+                상품타입_en = rev_type_map.get(recent_type, recent_type)
+                상품상세_en = from_korean_detail(상품상세_ko)
+                save_doc = {
+                    "날짜": str(today if st.session_state.prefill_from_history else 날짜),
+                    "상품상세": 상품상세_en,
+                    "상품상세_ko": 상품상세_ko,
+                    "상품카테고리": 상품카테고리_en,
+                    "상품타입": 상품타입_en,
+                    "수량": 수량,
+                    "단가": 단가,
+                    "수익": 수익,
+                    "가게위치": "Firebase",
+                    "가게ID": "LOCAL",
+                    "시간": datetime.now().strftime("%H:%M:%S"),
+                }
+                try:
+                    db.collection(SALES_COLLECTION).add(save_doc)
+                    st.success("✅ 저장되었습니다. (재고 자동 차감)")
+                    with st.spinner("재고 자동 차감 적용 중..."):
+                        adjust_inventory_by_recipe(
+                            상품상세_en,
+                            수량,
+                            move_type="sale",
+                            note=f"거래 추가: {상품상세_ko} x{수량}"
+                        )
+                    st.success("✅ 재고 차감 완료!")
+                    # 실시간 반영을 위해 캐시 클리어
+                    load_all_core_data.clear()
+                    load_inventory_df.clear()
+                    st.session_state.prefill_from_history = False
+                    safe_rerun()
+                except Exception as e:
+                    st.error(f"데이터 추가 실패: {e}")
+                    st.info("다시 시도 버튼을 눌러주세요.")
+                    if st.button("재시도", key="order_retry"):
+                        safe_rerun()
 
 # ==============================================================
 # 📊 경영 현황
@@ -2034,16 +2248,124 @@ elif menu == "재고 관리":
     # [수정] 모든 로직 전에 재고/파라미터를 먼저 로드
     df_inv = load_inventory_df()
     df_params = load_sku_params()
+
+    # === 핵심 요약 라인 및 재고 의미화 ===
+    usage_map = estimate_ingredient_daily_usage(df, RECIPES, days=30)
+    df_usage = df_inv.copy()
+    if not df_params.empty:
+        df_params_lookup = df_params.set_index("sku_en").to_dict("index")
+    else:
+        df_params_lookup = {}
+
+    def _lead_time_for_row(row):
+        params = df_params_lookup.get(row["상품상세_en"], {})
+        return safe_float(params.get("lead_time_days", row.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS)))
+
+    def _supply_mode_for_row(row):
+        params = df_params_lookup.get(row["상품상세_en"], {})
+        return params.get("supply_mode", row.get("supply_mode", DEFAULT_SUPPLY_MODE))
+
+    df_usage["일평균소진(추정)"] = df_usage["상품상세_en"].map(usage_map).fillna(0.0)
+    df_usage["lead_time_days"] = df_usage.apply(_lead_time_for_row, axis=1)
+    df_usage["supply_mode"] = df_usage.apply(_supply_mode_for_row, axis=1)
+    df_usage["판매 가능 일수"] = df_usage.apply(
+        lambda r: round(r["현재재고"] / max(r["일평균소진(추정)"], 0.01), 1) if r["일평균소진(추정)"] > 0 else float("inf"),
+        axis=1
+    )
+    df_usage["발주 추천일수"] = df_usage["판매 가능 일수"] - df_usage["lead_time_days"]
+    df_usage["잔 환산"] = df_usage.apply(lambda r: convert_stock_to_cups(r["현재재고"], r["uom"], DEFAULT_GRAMS_PER_CUP), axis=1)
+    df_usage["D-day"] = df_usage["판매 가능 일수"].apply(lambda x: "D-∞" if x == float("inf") else f"D-{max(int(round(x)),0)}")
+
+    def _status(days_left, lead):
+        if days_left == float("inf"):
+            return "충분"
+        if days_left <= max(lead, 0):
+            return "위험"
+        if days_left <= max(lead, 0) + 3:
+            return "주의"
+        return "충분"
+
+    df_usage["상태"] = df_usage.apply(lambda r: _status(r["판매 가능 일수"], r["lead_time_days"]), axis=1)
+    status_chip = {"충분": "🟢 충분", "주의": "🟡 주의", "위험": "🔴 위험"}
+    df_usage["상태표시"] = df_usage["상태"].map(status_chip)
+
+    key_items = df_usage[(df_usage["is_ingredient"] == True) & (df_usage["일평균소진(추정)"] > 0)]
+    if not key_items.empty:
+        key_items_sorted = key_items.sort_values("판매 가능 일수")
+        target_df = key_items_sorted[key_items_sorted["상품상세"].str.contains("원두")]
+        if target_df.empty:
+            target_df = key_items_sorted
+        target = target_df.iloc[0]
+        today_txt = format_date_with_holiday(datetime.now().date())
+        order_val = safe_float(target.get("발주 추천일수"), float("inf"))
+        if math.isfinite(order_val):
+            order_txt = f"{max(int(order_val), 0)}일 후"
+        else:
+            order_txt = "계산 불가"
+        lead_days_val = safe_float(target.get("lead_time_days"), float("nan"))
+        lead_txt = f"{lead_days_val:.0f}일 리드타임" if math.isfinite(lead_days_val) else "리드타임 미설정"
+        st.success(
+            f"대표님, 오늘({today_txt}) 기준 **{target['상품상세']}** 소진 예상 {target['D-day']} "
+            f"(약 {target['판매 가능 일수']:.1f}일 후) · 발주 추천: **{order_txt}** · 공급: {target['supply_mode']} ({lead_txt})"
+        )
+    else:
+        st.info("판매 데이터/레시피가 부족해 소진 예정일을 계산할 수 없습니다. 최근 거래와 레시피를 먼저 등록해주세요.")
+
+    ing_usage_view = df_usage[df_usage["is_ingredient"] == True].copy()
+    if not ing_usage_view.empty:
+        st.subheader("주요 재고 현황 (잔/개 단위로 직관적으로)")
+        ing_usage_view["현재 재고"] = ing_usage_view.apply(
+            lambda r: f"{r['현재재고']:,.0f}{r['uom']} (약 {r['잔 환산']:,.0f}잔)" if r["잔 환산"] else f"{r['현재재고']:,.0f}{r['uom']}",
+            axis=1
+        )
+        ing_usage_view["일평균 소진"] = ing_usage_view.apply(
+            lambda r: (
+                f"{r['일평균소진(추정)']:.2f}{r['uom']} "
+                f"(약 {convert_stock_to_cups(r['일평균소진(추정)'], r['uom'], DEFAULT_GRAMS_PER_CUP):.1f}잔)"
+            ) if r["uom"] == "g" else f"{r['일평균소진(추정)']:.2f}{r['uom']}",
+            axis=1
+        )
+        ing_usage_view["발주 시점"] = ing_usage_view["lead_time_days"].apply(lambda x: f"{x:.0f}일 전")
+        ing_usage_view["판매 가능 일수"] = ing_usage_view["판매 가능 일수"].replace(float("inf"), 9999)
+        display_cols = ["상품상세", "상태표시", "현재 재고", "일평균 소진", "판매 가능 일수", "D-day", "발주 시점", "supply_mode"]
+        st.dataframe(
+            ing_usage_view[display_cols].rename(columns={
+                "상품상세": "품목",
+                "상태표시": "상태",
+                "판매 가능 일수": "판매 가능 일수(일)",
+                "발주 시점": "발주 시점",
+                "supply_mode": "공급 방식"
+            }),
+            use_container_width=True
+        )
+
+        for _, r in ing_usage_view.iterrows():
+            with st.expander(f"왜 그렇지? ({r['상품상세']})"):
+                order_days_val = safe_float(r.get("발주 추천일수"), float("inf"))
+                if math.isfinite(order_days_val):
+                    order_txt = f"{max(int(order_days_val), 0)}일 후"
+                else:
+                    order_txt = "계산 불가"
+                lead_days_val = safe_float(r.get("lead_time_days"), float("nan"))
+                lead_txt = f"{lead_days_val:.0f}일" if math.isfinite(lead_days_val) else "미설정"
+                st.markdown(
+                    f"""
+                    - 현재 재고: {r['현재 재고']}
+                    - 일평균 소진량(추정): {r['일평균소진(추정)']:.2f}{r['uom']}{" (약 " + str(round(convert_stock_to_cups(r['일평균소진(추정)'], r['uom'], DEFAULT_GRAMS_PER_CUP),1)) + "잔" if r['uom']=='g' else ""}
+                    - 판매 가능 일수: {r['판매 가능 일수']}일 ({r['D-day']})
+                    - 발주 추천일: {order_txt} (리드타임 {lead_txt}, 공급 방식: {r['supply_mode']})
+                    """
+                )
     
-    # [UX 개선] 3중 탭을 2개의 명확한 탭으로 재구성
-    tab1, tab2 = st.tabs(["📊 재료/원가 마스터", "📜 레시피 편집기 (BOM)"])
+    # [UX 개선] 쉬운 용어로 탭 구성
+    tab1, tab2 = st.tabs(["🧾 재료/가격 설정", "🥤 메뉴 레시피 설정"])
 
     # ==============================================================
     # TAB 1: (신규) 재료/원가 마스터
     # ==============================================================
     with tab1:
-        st.subheader("📊 재료/원가 마스터 관리")
-        st.info("이곳에서 모든 품목의 **재고, 원가, 재료 여부**를 한눈에 관리합니다.")
+        st.subheader("📊 재료/가격 설정 (쉽게 보기)")
+        st.info("재료 여부, 재고, 매입가, 공급 방식을 한눈에 설정하세요.")
 
         with st.expander("⚠️ 인벤토리 초기화 (시드 재료만 남김)"):
             st.warning("모든 재고 품목을 삭제하고 시드 재료 9종(에스프레소, 헤이즐 시럽 등)만 다시 등록합니다. 되돌릴 수 없습니다.")
@@ -2087,10 +2409,12 @@ elif menu == "재고 관리":
         seed_names = set([item["ko"] for item in SEED_INGREDIENTS])
         df_inv_edit = df_inv[df_inv['상품상세'].isin(seed_names)].copy()
         df_inv_edit = df_inv_edit.sort_values('상품상세')
+        df_inv_edit['supply_mode'] = df_inv_edit['supply_mode'].fillna(DEFAULT_SUPPLY_MODE)
+        df_inv_edit['supply_lead_days'] = df_inv_edit['supply_lead_days'].fillna(DEFAULT_SUPPLY_LEAD_DAYS)
         
         # [수정] data_editor에 'num_rows="dynamic"'을 추가하여 새 행 생성 허용
         edited_inv_df = st.data_editor(
-            df_inv_edit[['상품상세', 'is_ingredient', 'uom', '현재재고', 'cost_unit_size', 'cost_per_unit', '상품상세_en']],
+            df_inv_edit[['상품상세', 'is_ingredient', 'uom', '현재재고', 'cost_unit_size', 'cost_per_unit', 'supply_mode', 'supply_lead_days', '상품상세_en']],
             column_config={
                 "상품상세": st.column_config.TextColumn("품목명", disabled=False), 
                 "is_ingredient": st.column_config.CheckboxColumn("재료 여부 (체크)"),
@@ -2098,6 +2422,8 @@ elif menu == "재고 관리":
                 "현재재고": st.column_config.NumberColumn("현재 재고(수기)", min_value=0.0, format="%.2f"),
                 "cost_unit_size": st.column_config.NumberColumn("매입 단위(g/ml/ea)", min_value=1.0, format="%.0f"),
                 "cost_per_unit": st.column_config.NumberColumn("매입가(원)", min_value=0, format="%d원"),
+                "supply_mode": st.column_config.SelectboxColumn("공급 방식", options=SUPPLY_MODES),
+                "supply_lead_days": st.column_config.NumberColumn("리드타임(일)", min_value=0.0, format="%.0f일"),
                 "상품상세_en": st.column_config.TextColumn("SKU (Eng)", disabled=True, help="기존 품목은 SKU수정 불가, 신규 품목은 자동 생성됨"),
             },
             hide_index=True,
@@ -2134,7 +2460,9 @@ elif menu == "재고 관리":
                         "현재재고": safe_float(item['현재재고'], 0.0),
                         "초기재고": 0.0, 
                         "cost_unit_size": safe_float(item['cost_unit_size'], 1.0),
-                        "cost_per_unit": safe_float(item['cost_per_unit'], 0.0)
+                        "cost_per_unit": safe_float(item['cost_per_unit'], 0.0),
+                        "supply_mode": item.get("supply_mode") or DEFAULT_SUPPLY_MODE,
+                        "supply_lead_days": safe_float(item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS))
                     })
                     created += 1
                     
@@ -2158,6 +2486,12 @@ elif menu == "재고 관리":
                     stock_new = safe_float(item['현재재고'], 0.0)
                     if orig_item.get('현재재고', 0.0) != stock_new:
                         patch['현재재고'] = stock_new
+                    supply_mode_new = item.get("supply_mode") or DEFAULT_SUPPLY_MODE
+                    if orig_item.get("supply_mode", DEFAULT_SUPPLY_MODE) != supply_mode_new:
+                        patch["supply_mode"] = supply_mode_new
+                    lead_new = safe_float(item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS), DEFAULT_SUPPLY_LEAD_DAYS)
+                    if orig_item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS) != lead_new:
+                        patch["supply_lead_days"] = lead_new
 
                     if patch: 
                         doc_ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(sku_en))
@@ -2166,6 +2500,8 @@ elif menu == "재고 관리":
             
             if changed > 0 or created > 0:
                 batch.commit()
+                load_inventory_df.clear()
+                load_all_core_data.clear()
                 st.success(f"✅ {created}건 생성, {changed}건 업데이트 완료.")
                 st.balloons()
                 safe_rerun()
@@ -2280,12 +2616,21 @@ elif menu == "재고 관리":
             else:
                 display_cols = ['상품상세', '상태', '현재재고', 'uom', '권장발주', '커버일수', '일평균소진', 'ROP']
                 formatted_df = report_df[display_cols].copy()
+                formatted_df['상태'] = formatted_df['상태'].replace({
+                    '🚨 발주요망': '🔴 위험',
+                    '✅ 정상': '🟢 충분'
+                })
                 formatted_df['현재재고'] = formatted_df.apply(lambda r: f"{r['현재재고']:,.1f} {r['uom']}", axis=1)
                 formatted_df['권장발주'] = formatted_df.apply(lambda r: f"{r['권장발주']:,.1f} {r['uom']}", axis=1)
                 formatted_df['일평균소진'] = formatted_df.apply(lambda r: f"{r['일평균소진']:,.1f} {r['uom']}", axis=1)
                 formatted_df['ROP'] = formatted_df.apply(lambda r: f"{r['ROP']:,.1f} {r['uom']}", axis=1)
                 formatted_df['커버일수'] = formatted_df['커버일수'].apply(lambda x: f"{x}일")
-                st.dataframe(formatted_df[['상품상세', '상태', '현재재고', '권장발주', '커버일수', '일평균소진', 'ROP']], use_container_width=True)
+                st.dataframe(
+                    formatted_df[['상품상세', '상태', '현재재고', '권장발주', '커버일수', '일평균소진', 'ROP']].rename(
+                        columns={"커버일수": "판매 가능 일수", "ROP": "발주 시점"}
+                    ),
+                    use_container_width=True
+                )
         
         except Exception as e:
             st.error(f"AI 재고 리포트 생성 중 오류가 발생했습니다: {e}")
