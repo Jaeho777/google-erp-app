@@ -7,6 +7,7 @@ import os
 import json
 import re
 import warnings
+import math
 from math import ceil
 from pathlib import Path
 from datetime import datetime
@@ -2296,11 +2297,16 @@ elif menu == "재고 관리":
             target_df = key_items_sorted
         target = target_df.iloc[0]
         today_txt = format_date_with_holiday(datetime.now().date())
-        order_in = max(int(target["발주 추천일수"]), 0)
-        lead_txt = f"{target['lead_time_days']:.0f}일 리드타임"
+        order_val = safe_float(target.get("발주 추천일수"), float("inf"))
+        if math.isfinite(order_val):
+            order_txt = f"{max(int(order_val), 0)}일 후"
+        else:
+            order_txt = "계산 불가"
+        lead_days_val = safe_float(target.get("lead_time_days"), float("nan"))
+        lead_txt = f"{lead_days_val:.0f}일 리드타임" if math.isfinite(lead_days_val) else "리드타임 미설정"
         st.success(
             f"대표님, 오늘({today_txt}) 기준 **{target['상품상세']}** 소진 예상 {target['D-day']} "
-            f"(약 {target['판매 가능 일수']:.1f}일 후) · 발주 추천: **{order_in}일 후** · 공급: {target['supply_mode']} ({lead_txt})"
+            f"(약 {target['판매 가능 일수']:.1f}일 후) · 발주 추천: **{order_txt}** · 공급: {target['supply_mode']} ({lead_txt})"
         )
     else:
         st.info("판매 데이터/레시피가 부족해 소진 예정일을 계산할 수 없습니다. 최근 거래와 레시피를 먼저 등록해주세요.")
@@ -2335,12 +2341,19 @@ elif menu == "재고 관리":
 
         for _, r in ing_usage_view.iterrows():
             with st.expander(f"왜 그렇지? ({r['상품상세']})"):
+                order_days_val = safe_float(r.get("발주 추천일수"), float("inf"))
+                if math.isfinite(order_days_val):
+                    order_txt = f"{max(int(order_days_val), 0)}일 후"
+                else:
+                    order_txt = "계산 불가"
+                lead_days_val = safe_float(r.get("lead_time_days"), float("nan"))
+                lead_txt = f"{lead_days_val:.0f}일" if math.isfinite(lead_days_val) else "미설정"
                 st.markdown(
                     f"""
                     - 현재 재고: {r['현재 재고']}
                     - 일평균 소진량(추정): {r['일평균소진(추정)']:.2f}{r['uom']}{" (약 " + str(round(convert_stock_to_cups(r['일평균소진(추정)'], r['uom'], DEFAULT_GRAMS_PER_CUP),1)) + "잔" if r['uom']=='g' else ""}
                     - 판매 가능 일수: {r['판매 가능 일수']}일 ({r['D-day']})
-                    - 발주 추천일: {max(int(r['발주 추천일수']), 0)}일 후 (리드타임 {r['lead_time_days']:.0f}일, 공급 방식: {r['supply_mode']})
+                    - 발주 추천일: {order_txt} (리드타임 {lead_txt}, 공급 방식: {r['supply_mode']})
                     """
                 )
     
