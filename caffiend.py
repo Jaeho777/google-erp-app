@@ -915,6 +915,17 @@ def load_sku_params() -> pd.DataFrame:
                 dfp[col] = pd.to_numeric(dfp[col], errors="coerce").fillna(default)
     return dfp
 
+# --- 캐시 안전 초기화 헬퍼 ---
+def clear_cache_safe(*funcs):
+    """Streamlit cache 함수의 clear()를 안전하게 호출합니다."""
+    for fn in funcs:
+        clear_fn = getattr(fn, "clear", None)
+        if callable(clear_fn):
+            try:
+                clear_fn()
+            except Exception:
+                pass
+
 # --- 3. 헬퍼 함수 정의 (정의 3: Ensure Inventory Doc) ---
 def ensure_inventory_doc(product_detail_en: str, uom: str = "ea", is_ingredient: bool = False):
     ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(product_detail_en))
@@ -1443,6 +1454,7 @@ def compute_ingredient_metrics_for_menu(
     )
 
     # 3. 사용할 판매량(sold_sum) 및 기준일(days) 결정
+    fallback_chart_data = None
     use_historical_fallback = False
     
     if predicted_menu_sales is None or predicted_menu_sales == 0:
@@ -1450,6 +1462,22 @@ def compute_ingredient_metrics_for_menu(
         sold_sum = sold_sum_historical # 과거 데이터 사용
         days = window_days_fallback
         use_historical_fallback = True
+        # 과거 판매량 차트도 함께 표시
+        try:
+            df_hist = df_all_sales.copy()
+            if "날짜" in df_hist.columns and not pd.api.types.is_datetime64_any_dtype(df_hist["날짜"]):
+                df_hist["날짜"] = pd.to_datetime(df_hist["날짜"], errors="coerce")
+            max_day = df_hist["날짜"].max()
+            min_day = max_day - pd.Timedelta(days=window_days_fallback - 1)
+            df_hist = df_hist[
+                (df_hist["날짜"] >= min_day) & (df_hist["날짜"] <= max_day) &
+                (df_hist["상품상세"] == menu_name_kr_base)
+            ]
+            df_hist = df_hist.groupby(df_hist["날짜"].dt.date)["수량"].sum().reset_index()
+            if not df_hist.empty:
+                fallback_chart_data = df_hist.rename(columns={"날짜": "ds", "수량": "y"})
+        except Exception:
+            pass
     else:
         st.success(f"🤖 **AI 예측**: '{to_korean_detail(menu_sku_en)}'의 향후 **{target_days_forecast}일간** 예상 판매량을 **{predicted_menu_sales:,.0f}개**로 예측했습니다.")
         sold_sum = predicted_menu_sales # 예측값으로 대체
@@ -1474,6 +1502,12 @@ def compute_ingredient_metrics_for_menu(
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as e:
                 st.error(f"예측 차트 생성 오류: {e}")
+        elif fallback_chart_data is not None and not fallback_chart_data.empty:
+            try:
+                fig_hist = px.bar(fallback_chart_data, x="ds", y="y", title=f"'{to_korean_detail(menu_sku_en)}' 최근 {window_days_fallback}일 판매량", labels={"ds": "날짜", "y": "판매량"})
+                st.plotly_chart(fig_hist, use_container_width=True)
+            except Exception:
+                pass
 
     # 4. 레시피 기반 원재료 소진량 계산 (기존 로직 활용)
     rows = []
@@ -1983,7 +2017,7 @@ if menu == "거래 추가":
                             }
                             db.collection(SALES_COLLECTION).add(doc)
                             adjust_inventory_by_recipe(doc["상품상세"], doc["수량"], move_type="sale_quick", note="히스토리 바로 추가")
-                            load_all_core_data.clear(); load_inventory_df.clear()
+                            clear_cache_safe(load_all_core_data, load_inventory_df)
                             st.success("✅ 바로 추가 완료")
                             safe_rerun()
                         except Exception as e:
@@ -2075,8 +2109,7 @@ if menu == "거래 추가":
                         )
                     st.success("✅ 재고 차감 완료!")
                     # 실시간 반영을 위해 캐시 클리어
-                    load_all_core_data.clear()
-                    load_inventory_df.clear()
+                    clear_cache_safe(load_all_core_data, load_inventory_df)
                     st.session_state.prefill_from_history = False
                     safe_rerun()
                 except Exception as e:
@@ -2967,26 +3000,27 @@ elif menu == "재고 관리":
         df_inv_edit['supply_mode'] = df_inv_edit['supply_mode'].fillna(DEFAULT_SUPPLY_MODE)
         df_inv_edit['supply_lead_days'] = df_inv_edit['supply_lead_days'].fillna(DEFAULT_SUPPLY_LEAD_DAYS)
         
-        # [수정] data_editor에 'num_rows="dynamic"'을 추가하여 새 행 생성 허용
-        edited_inv_df = st.data_editor(
-            df_inv_edit[['상품상세', 'is_ingredient', 'uom', '현재재고', 'cost_unit_size', 'cost_per_unit', 'supply_mode', 'supply_lead_days', '상품상세_en']],
-            column_config={
-                "상품상세": st.column_config.TextColumn("품목명", disabled=False), 
-                "is_ingredient": st.column_config.CheckboxColumn("재료 여부 (체크)"),
-                "uom": st.column_config.TextColumn("기본 단위", disabled=False), 
-                "현재재고": st.column_config.NumberColumn("현재 재고(수기)", min_value=0.0, format="%.2f"),
-                "cost_unit_size": st.column_config.NumberColumn("매입 단위(g/ml/ea)", min_value=1.0, format="%.0f"),
-                "cost_per_unit": st.column_config.NumberColumn("매입가(원)", min_value=0, format="%d원"),
-                "supply_mode": st.column_config.SelectboxColumn("공급 방식", options=SUPPLY_MODES),
-                "supply_lead_days": st.column_config.NumberColumn("리드타임(일)", min_value=0.0, format="%.0f일"),
-                "상품상세_en": st.column_config.TextColumn("SKU (Eng)", disabled=True, help="기존 품목은 SKU수정 불가, 신규 품목은 자동 생성됨"),
-            },
-            hide_index=True,
-            num_rows="fixed",  # 👈 SEED 품목만 유지 (새 행 추가 불가)
-            use_container_width=True
-        )
+        with st.form(key="inventory_master_form"):
+            edited_inv_df = st.data_editor(
+                df_inv_edit[['상품상세', 'is_ingredient', 'uom', '현재재고', 'cost_unit_size', 'cost_per_unit', 'supply_mode', 'supply_lead_days', '상품상세_en']],
+                column_config={
+                    "상품상세": st.column_config.TextColumn("품목명", disabled=False), 
+                    "is_ingredient": st.column_config.CheckboxColumn("재료 여부 (체크)"),
+                    "uom": st.column_config.TextColumn("기본 단위", disabled=False), 
+                    "현재재고": st.column_config.NumberColumn("현재 재고(수기)", min_value=0.0, format="%.2f"),
+                    "cost_unit_size": st.column_config.NumberColumn("매입 단위(g/ml/ea)", min_value=1.0, format="%.0f"),
+                    "cost_per_unit": st.column_config.NumberColumn("매입가(원)", min_value=0, format="%d원"),
+                    "supply_mode": st.column_config.SelectboxColumn("공급 방식", options=SUPPLY_MODES),
+                    "supply_lead_days": st.column_config.NumberColumn("리드타임(일)", min_value=0.0, format="%.0f일"),
+                    "상품상세_en": st.column_config.TextColumn("SKU (Eng)", disabled=True, help="기존 품목은 SKU수정 불가, 신규 품목은 자동 생성됨"),
+                },
+                hide_index=True,
+                num_rows="fixed",  # 👈 SEED 품목만 유지 (새 행 추가 불가)
+                use_container_width=True
+            )
+            submitted_inv = st.form_submit_button("💾 '재료/원가/재고' 설정 저장하기", type="primary")
 
-        if st.button("💾 '재료/원가/재고' 설정 저장하기", type="primary"):
+        if submitted_inv:
             changed = 0
             created = 0 
             batch = db.batch()
@@ -3055,8 +3089,7 @@ elif menu == "재고 관리":
             
             if changed > 0 or created > 0:
                 batch.commit()
-                load_inventory_df.clear()
-                load_all_core_data.clear()
+                clear_cache_safe(load_inventory_df, load_all_core_data)
                 st.success(f"✅ {created}건 생성, {changed}건 업데이트 완료.")
                 st.balloons()
                 safe_rerun()
@@ -3111,25 +3144,28 @@ elif menu == "재고 관리":
         if not recipe_df_rows:
             recipe_df_rows = [{"재료": None, "수량": 0.0, "단위": "g", "손실률(%)": 0.0}]
         df_recipe_editor = pd.DataFrame(recipe_df_rows)
-        st.subheader(f"📝 `{selected_menu_kr}` 레시피 편집")
-        edited_df = st.data_editor(
-            df_recipe_editor,
-            column_config={
-                "재료": st.column_config.SelectboxColumn("재료 (필수)", options=ingredient_options_kr, required=True),
-                "수량": st.column_config.NumberColumn("수량", min_value=0.0, format="%.2f", required=True),
-                "단위": st.column_config.SelectboxColumn("단위", options=["g", "ml", "ea"], required=True),
-                "손실률(%)": st.column_config.NumberColumn("손실률(%)", min_value=0.0, max_value=100.0, format="%.1f %%", required=True),
-            },
-            num_rows="dynamic",
-            use_container_width=True
-        )
+        with st.form(key="recipe_editor_form"):
+            st.subheader(f"📝 `{selected_menu_kr}` 레시피 편집")
+            edited_df = st.data_editor(
+                df_recipe_editor,
+                column_config={
+                    "재료": st.column_config.SelectboxColumn("재료 (필수)", options=ingredient_options_kr, required=True),
+                    "수량": st.column_config.NumberColumn("수량", min_value=0.0, format="%.2f", required=True),
+                    "단위": st.column_config.SelectboxColumn("단위", options=["g", "ml", "ea"], required=True),
+                    "손실률(%)": st.column_config.NumberColumn("손실률(%)", min_value=0.0, max_value=100.0, format="%.1f %%", required=True),
+                },
+                num_rows="dynamic",
+                use_container_width=True
+            )
+            submitted_recipe = st.form_submit_button(f"💾 `{selected_menu_kr}` 레시피 저장하기", type="primary")
         
-        if st.button(f"💾 `{selected_menu_kr}` 레시피 저장하기", type="primary"):
+        if submitted_recipe:
             final_ingredients = []
             valid = True
             for index, row in edited_df.iterrows():
                 재료_kr = row["재료"]
-                if not 재료_kr: continue 
+                if not 재료_kr: 
+                    continue 
                 재료_en = ing_kr_to_en_map.get(재료_kr)
                 if not 재료_en:
                     st.error(f"'{재료_kr}'는 유효한 재료가 아닙니다. '재료/원가 마스터' 탭을 확인하세요.")
@@ -3140,16 +3176,17 @@ elif menu == "재고 관리":
                     "uom": normalize_uom(row["단위"]),
                     "waste_pct": safe_float(row["손실률(%)"]),
                 })
-            if valid and not final_ingredients: st.warning("저장할 재료가 없습니다. (모든 행이 비어있음)")
+            if valid and not final_ingredients:
+                st.warning("저장할 재료가 없습니다. (모든 행이 비어있음)")
             elif valid and final_ingredients:
                 try:
                     db.collection(RECIPES_COLLECTION).document(safe_doc_id(selected_menu_en)).set({"ingredients": final_ingredients})
-                    load_all_core_data.clear() 
-                    load_recipe.clear()        
+                    clear_cache_safe(load_all_core_data, load_recipe)        
                     st.success(f"✅ `{selected_menu_kr}` 레시피가 성공적으로 저장되었습니다!")
                     st.balloons()
                     safe_rerun()
-                except Exception as e: st.error(f"Firebase 저장 실패: {e}")
+                except Exception as e:
+                    st.error(f"Firebase 저장 실패: {e}")
         
         # [복원] '예전 그래프' 로직으로 되돌립니다.
         st.divider()
@@ -3480,32 +3517,35 @@ elif menu == "데이터 편집":
                 num_rows="dynamic" # 👈 [핵심] 여기서 행 삭제 가능
             )
             
+        with st.form(key="sales_edit_form"):
             # [유지] 이 체크박스는 디자이너님 요청대로 남겨둡니다.
             reflect_inv = st.checkbox("저장 시 재고에 반영(차감/복원)", value=True)
             
-            if st.button("변경된 내용 저장하기 💾"):
-                changed = 0 # 수정된 행
-                deleted = 0 # 삭제된 행
+            submit_sales_edit = st.form_submit_button("변경된 내용 저장하기 💾")
+        
+        if submit_sales_edit:
+            changed = 0 # 수정된 행
+            deleted = 0 # 삭제된 행
                 
-                # [수정] data_editor에서 삭제된 행을 먼저 감지
-                orig_ids = set(df_view_fb['_id'])
-                edited_ids = set(edited_df['_id'])
-                deleted_ids = list(orig_ids - edited_ids)
+            # [수정] data_editor에서 삭제된 행을 먼저 감지
+            orig_ids = set(df_view_fb['_id'])
+            edited_ids = set(edited_df['_id'])
+            deleted_ids = list(orig_ids - edited_ids)
 
-                if deleted_ids:
-                    for doc_id in deleted_ids:
-                        if reflect_inv: # 삭제 시 재고 복원
-                            try:
-                                orig = df_raw[df_raw['_id'] == doc_id].iloc[0]
-                                qty_to_restore = -int(orig.get('수량', 0)) # 수량을 음수로
-                                detail_en = orig.get('상품상세')
-                                if qty_to_restore != 0 and detail_en:
-                                    adjust_inventory_by_recipe(detail_en, qty_to_restore, move_type="delete_restore", note=f"Deleted: {doc_id}")
-                            except Exception as e:
-                                st.warning(f"{doc_id} 재고 복원 실패: {e}")
-                        
-                        db.collection(SALES_COLLECTION).document(doc_id).delete()
-                        deleted += 1
+            if deleted_ids:
+                for doc_id in deleted_ids:
+                    if reflect_inv: # 삭제 시 재고 복원
+                        try:
+                            orig = df_raw[df_raw['_id'] == doc_id].iloc[0]
+                            qty_to_restore = -int(orig.get('수량', 0)) # 수량을 음수로
+                            detail_en = orig.get('상품상세')
+                            if qty_to_restore != 0 and detail_en:
+                                adjust_inventory_by_recipe(detail_en, qty_to_restore, move_type="delete_restore", note=f"Deleted: {doc_id}")
+                        except Exception as e:
+                            st.warning(f"{doc_id} 재고 복원 실패: {e}")
+                    
+                    db.collection(SALES_COLLECTION).document(doc_id).delete()
+                    deleted += 1
 
                 # [수정] 수정된 행 처리
                 for i, new in edited_df.iterrows():
