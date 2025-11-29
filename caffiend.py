@@ -12,6 +12,7 @@ from math import ceil
 from pathlib import Path
 from datetime import datetime
 import time # #[AI/ML 통합 추가] (Mock 응답용)
+import base64
 
 import streamlit as st
 import pandas as pd
@@ -27,15 +28,14 @@ from firebase_admin import credentials, firestore
 # === [AI/ML 통합 추가] ===
 # SPRINT 1 (AI 비서) 및 SPRINT 2 (수요 예측) 라이브러리
 try:
-    import openai
-    import time
+    from google import genai
     from prophet import Prophet
     from sklearn.model_selection import train_test_split
     from sklearn.metrics import mean_absolute_percentage_error
 except ImportError:
     st.error("""
     AI/ML 기능을 위한 라이브러리가 부족합니다.
-    터미널에서 'pip install openai prophet scikit-learn'를 실행해주세요.
+    터미널에서 'pip install google-genai prophet scikit-learn'를 실행해주세요.
     """)
     st.stop()
 # === [AI/ML 통합 추가] ===
@@ -277,16 +277,52 @@ def init_firestore():
 db = init_firestore()
 
 # === [AI/ML 통합 추가] ===
-# SPRINT 1: OpenAI API 키 설정
+# SPRINT 1: Gemini API 키 설정
+# 기본값: 키가 접근 가능한 2.5 세대 모델 우선 (필요 시 하위 버전으로 폴백)
+GEMINI_TEXT_MODEL = (
+    SECRETS.get("gemini", {}).get("text_model")
+    or os.environ.get("GEMINI_TEXT_MODEL")
+    or "gemini-2.5-flash"
+)
+GEMINI_VISION_MODEL = (
+    SECRETS.get("gemini", {}).get("vision_model")
+    or os.environ.get("GEMINI_VISION_MODEL")
+    or "gemini-2.5-flash"
+)
+GEMINI_TEXT_MODEL_CANDIDATES = [
+    GEMINI_TEXT_MODEL,
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-flash-latest",
+    "gemini-pro-latest",
+]
+GEMINI_VISION_MODEL_CANDIDATES = [
+    GEMINI_VISION_MODEL,
+    "gemini-2.5-pro",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-001",
+    "gemini-flash-latest",
+]
+GEMINI_API_KEY = None
+GEMINI_CLIENT = None
+
 try:
-    openai.api_key = st.secrets["openai"]["api_key"]
+    GEMINI_API_KEY = st.secrets["gemini"]["api_key"]
 except (KeyError, AttributeError):
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    try:
+        GEMINI_CLIENT = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        st.error(f"Gemini API 키 설정 중 오류가 발생했습니다: {e}")
+else:
     st.warning("""
-    OpenAI API 키가 'secrets.toml'에 설정되지 않았습니다. 
+    Gemini API 키가 'secrets.toml'에 설정되지 않았습니다. 
     AI 비서 기능이 작동하지 않거나 Mock 데이터로 작동합니다.
-    [.streamlit/secrets.toml] 파일에 [openai] api_key = "sk-..."를 추가하세요.
+    [.streamlit/secrets.toml] 파일에 [gemini] api_key = "..."를 추가하거나 환경변수 GEMINI_API_KEY를 설정하세요.
     """)
-    openai.api_key = None # 키가 없어도 앱이 멈추지 않도록
 # === [AI/ML 통합 추가] ===
 
 # ----------------------
@@ -1176,72 +1212,74 @@ def adjust_inventory_by_recipe(menu_sku_en: str,
     db.collection(STOCK_MOVES_COLLECTION).add(log_doc)
 
 # === [AI/ML 통합 추가] ===
-# SPRINT 1: OpenAI API 호출 헬퍼
-def call_openai_api(user_prompt: str, data_context: str, model="gpt-3.5-turbo"):
+# SPRINT 1: Gemini API 호출 헬퍼
+def call_gemini_api(user_prompt: str, data_context: str, model: str = GEMINI_TEXT_MODEL):
     """
     [AI 수정 2] data_context(사실)와 user_prompt(요청)를 분리하여 AI가 '거짓말'을 하지 않도록 수정.
-    data_context는 'system' 메시지로, user_prompt는 'user' 메시지로 전달.
+    data_context는 시스템 지시로 전달합니다.
     """
-    
-    # 1. API 키가 없는 경우
-    if not openai.api_key:
-        time.sleep(1.5) 
-        st.error("OpenAI API 키가 'secrets.toml'에 설정되지 않았습니다.")
-        return (f"⚠️ **[AI 응답 실패 (API 키 없음)]**\n\n"
-                f"'secrets.toml'에 OpenAI API 키가 설정되지 않았습니다.\n\n"
-                f"--- (데이터 컨텍스트) ---\n{data_context}\n\n"
-                f"--- (사용자 요청) ---\n{user_prompt}")
 
-    # 2. API 호출 시도
-    try:
-        # [수정] 시스템 메시지와 사용자 메시지를 명확히 분리
-        response = openai.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": (
-                    "당신은 카페 운영 및 마케팅 전문가입니다. "
-                    "다음은 현재 카페의 실제 데이터입니다. 이 데이터를 '사실'로 간주하고, "
-                    "이 '사실'에 기반해서만 답변해야 합니다. 절대 데이터를 지어내지 마세요.\n\n"
-                    f"--- [카페 실제 데이터] ---\n{data_context}\n--- [데이터 끝] ---"
-                )},
-                {"role": "user", "content": user_prompt}
-            ]
+    # 1. API 키가 없는 경우
+    if not GEMINI_API_KEY:
+        time.sleep(1.5)
+        st.error("Gemini API 키가 'secrets.toml'에 설정되지 않았습니다.")
+        return (
+            "⚠️ **[AI 응답 실패 (API 키 없음)]**\n\n"
+            "'secrets.toml'에 Gemini API 키가 설정되지 않았습니다.\n\n"
+            f"--- (데이터 컨텍스트) ---\n{data_context}\n\n"
+            f"--- (사용자 요청) ---\n{user_prompt}"
         )
-        return response.choices[0].message.content
-        
-    # 3. [수정] 잔액 부족 또는 API 오류 발생 시
-    except openai.InsufficientQuotaError as e:
-        # "가짜 응답"이 아닌, 명확한 '오류'와 '시도했던 내용'을 반환
-        st.error(f"❌ OpenAI API 호출 실패: 잔액(Quota)이 부족합니다. (오류: {e.message})")
-        return (f"⚠️ **[AI 응답 실패 (잔액 부족)]**\n\n"
-                f"OpenAI 계정의 잔액이 부족하여 응답을 생성할 수 없습니다.\n\n"
-                f"--- (AI가 전달받은 데이터) ---\n{data_context}\n\n"
-                f"--- (AI가 요청받은 작업) ---\n{user_prompt}")
-        
-    except openai.AuthenticationError as e:
-        st.error("❌ OpenAI API 호출 실패: API 키가 잘못되었습니다. 'secrets.toml'을 확인하세요.")
+
+    if not GEMINI_CLIENT:
+        st.error("Gemini 클라이언트를 초기화하지 못했습니다.")
         return None
-    except Exception as e:
-        st.error(f"OpenAI API 호출 중 알 수 없는 오류 발생: {e}")
-        return None
+
+    system_instruction = (
+        "당신은 카페 운영 및 마케팅 전문가입니다. "
+        "다음은 현재 카페의 실제 데이터입니다. 이 데이터를 '사실'로 간주하고, "
+        "이 '사실'에 기반해서만 답변해야 합니다. 절대 데이터를 지어내지 마세요.\n\n"
+        f"--- [카페 실제 데이터] ---\n{data_context}\n--- [데이터 끝] ---"
+    )
+    prompt_text = f"{system_instruction}\n\n[사용자 요청]\n{user_prompt}"
+
+    # 2. API 호출 (3.5 우선, 실패 시 하위 버전 폴백)
+    candidates = GEMINI_TEXT_MODEL_CANDIDATES
+    last_error = None
+    for m in candidates:
+        try:
+            response = GEMINI_CLIENT.models.generate_content(
+                model=m,
+                contents=[{"role": "user", "parts": [{"text": prompt_text}]}],
+                config={"response_mime_type": "text/plain"},
+            )
+            if getattr(response, "text", None):
+                if m != candidates[0]:
+                    st.info(f"⚠️ 기본 모델 실패로 {m} 으로 폴백했습니다.")
+                return response.text
+        except Exception as e:
+            last_error = e
+            continue
+    st.error(f"Gemini API 호출 중 오류 발생: {last_error}")
+    return None
     
 # ==========================================
 # [AI/ML 통합 추가] 영수증 이미지 분석 헬퍼 함수
 # ==========================================
-import base64
-
 def analyze_receipt_image(uploaded_file):
     """
-    업로드된 영수증 이미지를 GPT-4o(Vision)에게 보내서
-    상호명, 날짜, 시간, 품목 리스트, 총액을 JSON으로 추출합니다.
+    업로드된 영수증 이미지를 Gemini에게 보내서 상호명, 날짜, 시간, 품목 리스트, 총액을 JSON으로 추출합니다.
     """
-    if not openai.api_key:
-        st.error("OpenAI API 키가 설정되지 않았습니다.")
+    if not GEMINI_API_KEY:
+        st.error("Gemini API 키가 설정되지 않았습니다.")
+        return None
+    if not GEMINI_CLIENT:
+        st.error("Gemini 클라이언트를 초기화하지 못했습니다.")
         return None
 
-    # 1. 이미지를 Base64로 인코딩
+    # 1. 업로드된 이미지를 바이너리 형태로 준비
     bytes_data = uploaded_file.getvalue()
-    base64_image = base64.b64encode(bytes_data).decode('utf-8')
+    mime_type = getattr(uploaded_file, "type", None) or "image/jpeg"
+    encoded_image = base64.b64encode(bytes_data).decode("utf-8")
 
     # 2. 프롬프트 설정 (JSON 형식 강제)
     system_prompt = """
@@ -1259,26 +1297,36 @@ def analyze_receipt_image(uploaded_file):
     If date/time is missing, use null. Prices should be numbers (remove currency symbols).
     """
 
-    # 3. API 호출
-    try:
-        response = openai.chat.completions.create(
-            model="gpt-4o", # 또는 gpt-4-turbo
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": "Analyze this receipt image and extract data."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
-                ]}
-            ],
-            response_format={"type": "json_object"} # JSON 모드 활성화
-        )
-        
-        result_text = response.choices[0].message.content
-        return json.loads(result_text) # 딕셔너리로 변환하여 반환
+    # 3. API 호출 (3.5 우선, 실패 시 하위 버전 폴백)
+    candidates = GEMINI_VISION_MODEL_CANDIDATES
+    last_error = None
+    for m in candidates:
+        try:
+            response = GEMINI_CLIENT.models.generate_content(
+                model=m,
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": system_prompt},
+                            {"inline_data": {"mime_type": mime_type, "data": encoded_image}},
+                        ],
+                    }
+                ],
+                config={"response_mime_type": "application/json"},
+            )
 
-    except Exception as e:
-        st.error(f"이미지 분석 중 오류 발생: {e}")
-        return None
+            result_text = getattr(response, "text", "") or ""
+            if result_text:
+                if m != candidates[0]:
+                    st.info(f"⚠️ 기본 비전 모델 실패로 {m} 으로 폴백했습니다.")
+                return json.loads(result_text)  # 딕셔너리로 변환하여 반환
+        except Exception as e:
+            last_error = e
+            continue
+
+    st.error(f"이미지 분석 중 오류 발생: {last_error}")
+    return None
 
 # SPRINT 2: Prophet 수요 예측 헬퍼
 @st.cache_data(ttl=3600) # 1시간 캐시
@@ -1866,6 +1914,19 @@ if menu == "거래 추가":
     if "prefill_order" not in st.session_state:
         st.session_state.prefill_order = None
         st.session_state.prefill_from_history = False
+    st.session_state.setdefault("order_channel", "직접입력")
+
+    st.markdown("#### ⚡ 토스/당근 간편 입력")
+    c_toss, c_dg = st.columns(2)
+    with c_toss:
+        if st.button("채널1 간편 추가", key="btn_toss_quick", type="primary", use_container_width=True):
+            st.session_state.order_channel = "채널1"
+            st.toast("채널1로 입력 준비됐어요. 메뉴/가격만 고르면 됩니다.", icon="✨")
+    with c_dg:
+        if st.button("채널2 추가", key="btn_dg_quick", use_container_width=True):
+            st.session_state.order_channel = "채널2"
+            st.toast("채널2로 입력 준비됐어요. 메뉴/가격만 고르면 됩니다.", icon="🥕")
+    st.caption(f"현재 채널: **{st.session_state.order_channel}**")
 
     df_order = df.copy()
     if df_order.empty:
@@ -1917,6 +1978,7 @@ if menu == "거래 추가":
                                 "수익": item["수량"] * item["단가"],
                                 "가게위치": "Firebase",
                                 "가게ID": "LOCAL",
+                                "채널": st.session_state.get("order_channel", "직접입력"),
                                 "시간": datetime.now().strftime("%H:%M:%S"),
                             }
                             db.collection(SALES_COLLECTION).add(doc)
@@ -1998,6 +2060,7 @@ if menu == "거래 추가":
                     "수익": 수익,
                     "가게위치": "Firebase",
                     "가게ID": "LOCAL",
+                    "채널": st.session_state.get("order_channel", "직접입력"),
                     "시간": datetime.now().strftime("%H:%M:%S"),
                 }
                 try:
@@ -3356,7 +3419,7 @@ elif menu == "AI 비서":
                 {st.session_state.analysis_context.get('pattern', '아직 분석 안 함')}
                 """
                 
-                result_text = call_openai_api(
+                result_text = call_gemini_api(
                     user_prompt=prompt,
                     data_context=full_context
                 )
@@ -3716,7 +3779,7 @@ elif menu == "연구 검증":
     with col2:
         st.warning("**B. AI 확장형 (월 $50 + 변동비)**")
         st.markdown("""
-        * **포함:** 기본형 + AI 비서 (OpenAI), 수요 예측 (Prophet)
+        * **포함:** 기본형 + AI 비서 (Gemini), 수요 예측 (Prophet)
         * **대상:** 마케팅, 신메뉴 개발 등 데이터 기반 의사결정이 필요한 카페
         """)
     st.caption("이는 소상공인이 자신의 예산과 필요에 맞춰 합리적인 DX(디지털 전환)를 선택할 수 있게 하는 실용적인 설계안입니다.")
