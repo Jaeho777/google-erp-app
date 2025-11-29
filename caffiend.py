@@ -410,6 +410,58 @@ weekday_order_kr = ["월", "화", "수", "목", "금", "토", "일"]
 def map_series(s: pd.Series, mapping: dict) -> pd.Series:
     return s.apply(lambda x: mapping.get(x, x))
 
+NAME_MAP = {
+    # 불일치 정규화: Firestore/레시피 이름 -> 증강 CSV 기준 이름
+    "Americano (I H)": "Americano (I/H)",
+    "Latte": "Caffè Latte (I/H)",
+    "카페라떼I": "Caffè Latte (I/H)",
+    "헤이즐 아메I": "Hazelnut Americano (Iced)",
+    "바닐라빈라떼I": "Vanilla Bean Latte (Iced)",
+    "사케라또I": "Shakerato (Iced)",
+    # CSV에 없는 메뉴는 매핑하지 않음 (수동 삭제/재입력 대상)
+}
+
+def apply_name_map(name: str | None) -> str:
+    """증강 CSV 기준 메뉴 이름으로 정규화."""
+    if name is None:
+        return ""
+    raw = str(name).strip()
+    # 1) 직접 매핑 키
+    if raw in NAME_MAP:
+        return NAME_MAP[raw]
+    # 2) 언더바/슬래시/공백 변형 시도
+    variants = {
+        raw,
+        raw.replace("_", " "),
+        re.sub(r"\(([^)]+)_([^)]+)\)", r"(\1/\2)", raw),
+        raw.replace("(I H)", "(I/H)"),
+        raw.replace("(I/H)", "(I H)"),
+    }
+    for v in variants:
+        if v in NAME_MAP:
+            return NAME_MAP[v]
+    return raw
+
+def build_menu_candidates(name: str) -> set[str]:
+    """메뉴 이름의 다양한 변형(언더바, 슬래시, 사이즈 접미사 제거)을 모두 포함한 후보 집합 생성."""
+    raw = str(name or "").strip()
+    cleaned = raw.replace("_", " ")
+    slash = re.sub(r"\(([^)]+)_([^)]+)\)", r"(\1/\2)", raw)
+    base = re.sub(r"\s+(Lg|Rg|Sm)$", "", cleaned)
+    variants = {
+        raw,
+        cleaned,
+        slash,
+        base,
+        base.replace("(I H)", "(I/H)"),
+        base.replace("(I/H)", "(I H)"),
+    }
+    # 소문자/대문자 혼용 방지
+    variants |= {v.lower() for v in variants}
+    # 한글 변환 후보 추가
+    variants |= {to_korean_detail(v) for v in list(variants)}
+    return variants
+
 from typing import Union
 
 
@@ -550,6 +602,7 @@ def load_csv_FINAL(path: Path): # [Pylance 오류] 타입 힌트 제거
         st.stop()
 
     df = df_raw.copy()
+    df['menu_item'] = df['menu_item'].apply(apply_name_map)
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df['날짜'] = df['timestamp'].dt.normalize()
     df['시간'] = df['timestamp'].dt.strftime('%H:%M:%S')
@@ -563,6 +616,7 @@ def load_csv_FINAL(path: Path): # [Pylance 오류] 타입 힌트 제거
     df['수익'] = df['수량'] * df['단가']
 
     menu_series = df_raw['menu_item'] if 'menu_item' in df_raw.columns else pd.Series("미확인 메뉴", index=df.index)
+    menu_series = menu_series.apply(apply_name_map)
     df['상품상세'] = menu_series.fillna("미확인 메뉴")
 
     type_series = df_raw['menu_item'] if 'menu_item' in df_raw.columns else pd.Series("기타", index=df.index)
@@ -588,6 +642,8 @@ def load_csv_FINAL(path: Path): # [Pylance 오류] 타입 힌트 제거
     return df, load_time, row_count_final
 
 df_csv, load_time, row_count = load_csv_FINAL(CSV_PATH)
+MENU_MASTER_KR = sorted(pd.Series(df_csv.get('상품상세', [])).dropna().apply(to_korean_detail).unique().tolist())
+MENU_MASTER_EN = [from_korean_detail(n) for n in MENU_MASTER_KR]
 
 
 @st.cache_data(ttl=600)
@@ -788,6 +844,8 @@ def load_sales_from_firestore() -> pd.DataFrame:
     df_fb = pd.DataFrame(data)
     if df_fb.empty:
         return df_fb
+    if '상품상세' in df_fb.columns:
+        df_fb['상품상세'] = df_fb['상품상세'].apply(apply_name_map)
     if '날짜' in df_fb.columns:
         df_fb['날짜'] = parse_mixed_dates(df_fb['날짜'])
     if '수익' in df_fb.columns:
@@ -1016,6 +1074,8 @@ def load_all_core_data():
 
     # 1. Sales (df)
     df = pd.concat([df_csv, df_fb], ignore_index=True)
+    if '상품상세' in df.columns:
+        df['상품상세'] = df['상품상세'].apply(apply_name_map)
     if '요일' in df.columns:
         df['요일'] = map_series(df['요일'], weekday_map)
     if '상품카테고리' in df.columns:
@@ -1354,8 +1414,8 @@ def get_item_forecast(df_all_sales: pd.DataFrame, menu_sku_en: str, days_to_fore
         # === [수정 끝] ===
 
         # === [버그 수정] 이름 불일치 해결 ===
-        base_sku_en = re.sub(r"\s+(Lg|Rg|Sm)$", "", menu_sku_en.strip())
-        menu_name_kr_base = to_korean_detail(base_sku_en) # This should now be '아메리카노'
+        menu_candidates = build_menu_candidates(menu_sku_en)
+        menu_name_kr_base = to_korean_detail(re.sub(r"\s+(Lg|Rg|Sm)$", "", str(menu_sku_en).strip()))
         
         original_menu_name_kr = to_korean_detail(menu_sku_en)
         if original_menu_name_kr != menu_name_kr_base:
@@ -1363,7 +1423,7 @@ def get_item_forecast(df_all_sales: pd.DataFrame, menu_sku_en: str, days_to_fore
         # === [버그 수정 끝] ===
 
         df_item = df_all_sales[
-            df_all_sales['상품상세'] == menu_name_kr_base
+            df_all_sales['상품상세'].isin(menu_candidates)
         ].copy()
         
         if df_item.empty:
@@ -1430,8 +1490,8 @@ def compute_ingredient_metrics_for_menu(
         return pd.DataFrame()
 
     # === [버그 수정] 이름 불일치 해결 (Historical) ===
-    base_sku_en = re.sub(r"\s+(Lg|Rg|Sm)$", "", menu_sku_en.strip())
-    menu_name_kr_base = to_korean_detail(base_sku_en) # '아메리카노'
+    menu_candidates = build_menu_candidates(menu_sku_en)
+    menu_name_kr_base = to_korean_detail(re.sub(r"\s+(Lg|Rg|Sm)$", "", str(menu_sku_en).strip()))
     # === [버그 수정 끝] ===
 
     # === [수정] 예측 기간을 21일로 고정하여 버그 해결 ===
@@ -1446,7 +1506,7 @@ def compute_ingredient_metrics_for_menu(
         max_day = df_all_sales["날짜"].max()
         min_day = max_day - pd.Timedelta(days=window_days_fallback - 1)
         df_win = df_all_sales[(df_all_sales["날짜"] >= min_day) & (df_all_sales["날짜"] <= max_day)]
-        sold_sum_historical = df_win[df_win['상품상세'] == menu_name_kr_base]['수량'].sum()
+        sold_sum_historical = df_win[df_win['상품상세'].isin(menu_candidates)]['수량'].sum()
     
     # 2. [AI/ML] 미래 수요 예측
     predicted_menu_sales, forecast_chart_data = get_item_forecast(
@@ -1471,43 +1531,93 @@ def compute_ingredient_metrics_for_menu(
             min_day = max_day - pd.Timedelta(days=window_days_fallback - 1)
             df_hist = df_hist[
                 (df_hist["날짜"] >= min_day) & (df_hist["날짜"] <= max_day) &
-                (df_hist["상품상세"] == menu_name_kr_base)
+                (df_hist["상품상세"].isin(menu_candidates))
             ]
             df_hist = df_hist.groupby(df_hist["날짜"].dt.date)["수량"].sum().reset_index()
             if not df_hist.empty:
                 fallback_chart_data = df_hist.rename(columns={"날짜": "ds", "수량": "y"})
         except Exception:
-            pass
+            fallback_chart_data = None
     else:
         st.success(f"🤖 **AI 예측**: '{to_korean_detail(menu_sku_en)}'의 향후 **{target_days_forecast}일간** 예상 판매량을 **{predicted_menu_sales:,.0f}개**로 예측했습니다.")
         sold_sum = predicted_menu_sales # 예측값으로 대체
         days = target_days_forecast # 기준일도 예측 기간으로 변경
-        
-        # [복원] '예전 그래프' 로직을 여기에 다시 추가합니다.
+
+    # === 그래프 렌더링 (예측 성공/실패 모두 여기서 처리, Prophet 스타일 유지) ===
+    # 실제 판매 히스토리(전체 거래 내역) 집계
+    actual_history = df_all_sales[df_all_sales["상품상세"].isin(menu_candidates)].copy()
+    if not actual_history.empty:
+        if not pd.api.types.is_datetime64_any_dtype(actual_history["날짜"]):
+            actual_history["날짜"] = pd.to_datetime(actual_history["날짜"], errors="coerce")
+        actual_history = actual_history.dropna(subset=["날짜"])
+        actual_history = actual_history.groupby(actual_history["날짜"].dt.date)["수량"].sum().reset_index()
+        # 날짜 연속 구간으로 리샘플
+        if not actual_history.empty:
+            date_range_hist = pd.date_range(start=actual_history["날짜"].min(), end=actual_history["날짜"].max(), freq="D")
+            actual_history = actual_history.set_index("날짜").reindex(date_range_hist, fill_value=0).reset_index().rename(columns={"index": "날짜"})
+        actual_history.rename(columns={"날짜": "ds", "수량": "y"}, inplace=True)
+
+    try:
         if forecast_chart_data is not None:
-            try:
-                fig = px.line(forecast_chart_data, x='ds', y='yhat', 
-                                title=f"'{to_korean_detail(menu_sku_en)}' 전체 기간 수요 예측", 
-                                labels={'ds':'날짜', 'yhat':'예측 판매량'})
-                
-                actual_data = forecast_chart_data.dropna(subset=['y'])
-                fig.add_scatter(x=actual_data['ds'], y=actual_data['y'], 
-                                mode='markers', 
-                                name='실제 판매량', 
-                                marker=dict(color='rgba(0,0,255,0.5)', size=5))
-                
-                fig.add_scatter(x=forecast_chart_data['ds'], y=forecast_chart_data['yhat_lower'], fill='tozeroy', mode='lines', line=dict(color='rgba(0,0,0,0)'), name='불확실성(하한)')
-                fig.add_scatter(x=forecast_chart_data['ds'], y=forecast_chart_data['yhat_upper'], fill='tonexty', mode='lines', line=dict(color='rgba(0,0,0,0)'), fillcolor='rgba(231, 234, 241, 0.5)', name='불확실성(상한)')
-                
-                st.plotly_chart(fig, use_container_width=True)
-            except Exception as e:
-                st.error(f"예측 차트 생성 오류: {e}")
-        elif fallback_chart_data is not None and not fallback_chart_data.empty:
-            try:
-                fig_hist = px.bar(fallback_chart_data, x="ds", y="y", title=f"'{to_korean_detail(menu_sku_en)}' 최근 {window_days_fallback}일 판매량", labels={"ds": "날짜", "y": "판매량"})
-                st.plotly_chart(fig_hist, use_container_width=True)
-            except Exception:
-                pass
+            fig = px.line(
+                forecast_chart_data,
+                x="ds",
+                y="yhat",
+                title=f"'{to_korean_detail(menu_sku_en)}' 전체 기간 수요 예측",
+                labels={"ds": "날짜", "yhat": "예측 판매량"},
+            )
+            # 전체 거래 히스토리 라인
+            if not actual_history.empty:
+                fig.add_scatter(
+                    x=actual_history["ds"],
+                    y=actual_history["y"],
+                    mode="lines+markers",
+                    name="실제 판매량(전체)",
+                    line=dict(color="rgba(0,0,0,0.5)", width=2),
+                    marker=dict(color="rgba(0,0,0,0.6)", size=4),
+                )
+            # 예측에 포함된 과거 구간의 실제 y 점 표시
+            actual_data = forecast_chart_data.dropna(subset=["y"])
+            if not actual_data.empty:
+                fig.add_scatter(
+                    x=actual_data["ds"],
+                    y=actual_data["y"],
+                    mode="markers",
+                    name="실제 판매량(예측 구간)",
+                    marker=dict(color="rgba(0,0,255,0.5)", size=5),
+                )
+            fig.add_scatter(
+                x=forecast_chart_data["ds"],
+                y=forecast_chart_data["yhat_lower"],
+                fill="tozeroy",
+                mode="lines",
+                line=dict(color="rgba(0,0,0,0)"),
+                name="불확실성(하한)",
+            )
+            fig.add_scatter(
+                x=forecast_chart_data["ds"],
+                y=forecast_chart_data["yhat_upper"],
+                fill="tonexty",
+                mode="lines",
+                line=dict(color="rgba(0,0,0,0)"),
+                fillcolor="rgba(231, 234, 241, 0.5)",
+                name="불확실성(상한)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        elif fallback_chart_data is not None and not getattr(fallback_chart_data, "empty", True):
+            fig_line = px.line(
+                fallback_chart_data,
+                x="ds",
+                y="y",
+                markers=True,
+                title=f"'{to_korean_detail(menu_sku_en)}' 최근 {window_days_fallback}일 판매량",
+                labels={"ds": "날짜", "y": "판매량"},
+            )
+            st.plotly_chart(fig_line, use_container_width=True)
+        else:
+            st.info(f"'{to_korean_detail(menu_sku_en)}' 그래프를 표시할 데이터가 없습니다.")
+    except Exception as e:
+        st.error(f"예측/판매 차트 생성 오류: {e}")
 
     # 4. 레시피 기반 원재료 소진량 계산 (기존 로직 활용)
     rows = []
@@ -1962,7 +2072,8 @@ if menu == "거래 추가":
             st.toast("채널2로 입력 준비됐어요. 메뉴/가격만 고르면 됩니다.", icon="🥕")
     st.caption(f"현재 채널: **{st.session_state.order_channel}**")
 
-    df_order = df.copy()
+    # 메뉴/카테고리/타입 옵션은 증강 CSV 기준으로 제한
+    df_order = df_csv.copy()
     if df_order.empty:
         st.info("주문 가능한 메뉴가 없어서 시드 메뉴 5종을 임시로 채웠습니다.")
         df_order = pd.DataFrame({
@@ -2037,9 +2148,7 @@ if menu == "거래 추가":
 
     if 상품카테고리_ko:
         df_filtered_cat = df_order[df_order['상품카테고리'] == 상품카테고리_ko]
-        detail_options = sorted(pd.Series(df_filtered_cat['상품상세']).dropna().unique().tolist())
-        if prefill.get("상품상세") and prefill["상품상세"] not in detail_options:
-            detail_options.append(prefill["상품상세"])
+        detail_options = MENU_MASTER_KR
         상품상세_ko = choose_option("2. 메뉴 선택", detail_options, key="order_detail", placeholder="메뉴를 선택하세요...")
         if prefill and 상품상세_ko != prefill.get("상품상세"):
             st.session_state.prefill_from_history = False
@@ -2832,6 +2941,11 @@ elif menu == "기간별 분석":
 # ==============================================================
 elif menu == "재고 관리":
     st.header("📦 재고 관리")
+    # 데이터/예측 캐시를 강제로 갱신하고 싶을 때
+    if st.button("🔄 데이터 새로 불러오기 (캐시 초기화)", key="btn_reload_inventory"):
+        clear_cache_safe(load_all_core_data, load_inventory_df, load_sku_params, get_item_forecast)
+        st.toast("캐시를 비우고 데이터를 다시 불러옵니다.")
+        safe_rerun()
     
     # [수정] 모든 로직 전에 재고/파라미터를 먼저 로드
     df_inv = load_inventory_df()
@@ -2898,6 +3012,47 @@ elif menu == "재고 관리":
         )
     else:
         st.info("판매 데이터/레시피가 부족해 소진 예정일을 계산할 수 없습니다. 최근 거래와 레시피를 먼저 등록해주세요.")
+
+    # 🤖 메뉴별 AI 재고 영향도 분석 (Prophet 예측 기반)
+    st.divider()
+    st.subheader("🤖 메뉴별 재고 영향도 분석 (AI 예측)")
+    menu_list_en = [m for m in RECIPES.keys() if to_korean_detail(m) in MENU_MASTER_KR]
+    if not menu_list_en:
+        st.info("레시피가 등록된 메뉴가 없습니다. '레시피 편집기'에서 메뉴 레시피를 먼저 저장하세요.")
+    else:
+        menu_list_kr = sorted([to_korean_detail(sku) for sku in menu_list_en])
+        selected_menu_kr = st.selectbox("분석할 메뉴를 선택하세요", menu_list_kr, key="inv_ai_menu")
+        selected_menu_en = from_korean_detail(selected_menu_kr)
+
+        try:
+            report_df = compute_ingredient_metrics_for_menu(
+                selected_menu_en,
+                df,
+                df_inv,
+                df_params
+            )
+            if report_df.empty:
+                st.warning(f"'{selected_menu_kr}' 레시피 또는 판매 데이터가 부족합니다. 레시피를 저장하고 거래를 추가해 주세요.")
+            else:
+                display_cols = ['상품상세', '상태', '현재재고', 'uom', '권장발주', '커버일수', '일평균소진', 'ROP']
+                formatted_df = report_df[display_cols].copy()
+                formatted_df['상태'] = formatted_df['상태'].replace({
+                    '🚨 발주요망': '🔴 위험',
+                    '✅ 정상': '🟢 충분'
+                })
+                formatted_df['현재재고'] = formatted_df.apply(lambda r: f"{r['현재재고']:,.1f} {r['uom']}", axis=1)
+                formatted_df['권장발주'] = formatted_df.apply(lambda r: f"{r['권장발주']:,.1f} {r['uom']}", axis=1)
+                formatted_df['일평균소진'] = formatted_df.apply(lambda r: f"{r['일평균소진']:,.1f} {r['uom']}", axis=1)
+                formatted_df['ROP'] = formatted_df.apply(lambda r: f"{r['ROP']:,.1f} {r['uom']}", axis=1)
+                formatted_df['커버일수'] = formatted_df['커버일수'].apply(lambda x: f"{x}일")
+                st.dataframe(
+                    formatted_df[['상품상세', '상태', '현재재고', '권장발주', '커버일수', '일평균소진', 'ROP']].rename(
+                        columns={"커버일수": "판매 가능 일수", "ROP": "발주 시점"}
+                    ),
+                    use_container_width=True
+                )
+        except Exception as e:
+            st.error(f"AI 재고 영향도 분석 중 오류: {e}")
 
     ing_usage_view = df_usage[df_usage["is_ingredient"] == True].copy()
     if not ing_usage_view.empty:
@@ -3115,7 +3270,7 @@ elif menu == "재고 관리":
             st.error(f"재료 목록 로드 실패: {e}")
             st.stop()
             
-        all_menus_kr = sorted(df_inv[df_inv['is_ingredient'] == False]['상품상세'].unique().tolist())
+        all_menus_kr = MENU_MASTER_KR
         selected_menu_kr = st.selectbox(
             "레시피를 등록/수정할 메뉴를 선택하세요:",
             all_menus_kr
@@ -3610,21 +3765,22 @@ elif menu == "거래 내역":
     st.header("📋 전체 거래 내역")
     if df.empty:
         st.info("표시할 거래 데이터가 없습니다.")
+        st.caption(f"디버그: CSV {len(df_csv)}건, Firestore {len(df_fb)}건, 경로 {CSV_PATH}")
     else:
         
         # --- [UX 개선 1] 필터 및 검색 기능 추가 ---
         max_date = df['날짜'].max().date()
         min_date = df['날짜'].min().date()
 
-        # 1. 날짜 필터 (최신 날짜부터 30일 이전까지 기본값)
-        default_start_date = max_date - pd.Timedelta(days=30)
-        default_start_date = max(min_date, default_start_date) # 데이터 시작일보다 빠를 수 없음
-        
+        # 1. 날짜 필터 (기본값을 전체 구간으로 설정)
+        default_start_date = min_date
+        default_end_date = max_date
+
         col_date1, col_date2 = st.columns(2)
         with col_date1:
             start_date = st.date_input("조회 시작일", value=default_start_date, max_value=max_date)
         with col_date2:
-            end_date = st.date_input("조회 종료일", value=max_date, min_value=start_date, max_value=max_date)
+            end_date = st.date_input("조회 종료일", value=default_end_date, min_value=start_date, max_value=max_date)
         
         # 2. 텍스트 검색 필터
         search_query = st.text_input("상품 검색 (상품상세 또는 카테고리)", "")
