@@ -1042,6 +1042,7 @@ def compute_ingredient_metrics_for_menu(
     )
 
     # 3. 사용할 판매량(sold_sum) 및 기준일(days) 결정
+    fallback_chart_data = None
     use_historical_fallback = False
     
     if predicted_menu_sales is None or predicted_menu_sales == 0:
@@ -1049,6 +1050,22 @@ def compute_ingredient_metrics_for_menu(
         sold_sum = sold_sum_historical # 과거 데이터 사용
         days = window_days_fallback
         use_historical_fallback = True
+        # 과거 판매량 차트도 함께 표시
+        try:
+            df_hist = df_all_sales.copy()
+            if "날짜" in df_hist.columns and not pd.api.types.is_datetime64_any_dtype(df_hist["날짜"]):
+                df_hist["날짜"] = pd.to_datetime(df_hist["날짜"], errors="coerce")
+            max_day = df_hist["날짜"].max()
+            min_day = max_day - pd.Timedelta(days=window_days_fallback - 1)
+            df_hist = df_hist[
+                (df_hist["날짜"] >= min_day) & (df_hist["날짜"] <= max_day) &
+                (df_hist["상품상세"] == menu_name_kr_base)
+            ]
+            df_hist = df_hist.groupby(df_hist["날짜"].dt.date)["수량"].sum().reset_index()
+            if not df_hist.empty:
+                fallback_chart_data = df_hist.rename(columns={"날짜": "ds", "수량": "y"})
+        except Exception:
+            pass
     else:
         st.success(f"🤖 **AI 예측**: '{to_korean_detail(menu_sku_en)}'의 향후 **{target_days_forecast}일간** 예상 판매량을 **{predicted_menu_sales:,.0f}개**로 예측했습니다.")
         sold_sum = predicted_menu_sales # 예측값으로 대체
@@ -1073,6 +1090,18 @@ def compute_ingredient_metrics_for_menu(
                 st.plotly_chart(fig, use_container_width=True)
             except Exception as e:
                 st.error(f"예측 차트 생성 오류: {e}")
+        elif fallback_chart_data is not None:
+            try:
+                fig_hist = px.bar(
+                    fallback_chart_data,
+                    x="ds",
+                    y="y",
+                    title=f"'{to_korean_detail(menu_sku_en)}' 최근 {window_days_fallback}일 판매량",
+                    labels={"ds": "날짜", "y": "판매량"}
+                )
+                st.plotly_chart(fig_hist, use_container_width=True)
+            except Exception:
+                pass
 
     # 4. 레시피 기반 원재료 소진량 계산 (기존 로직 활용)
     rows = []
