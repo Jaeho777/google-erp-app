@@ -106,7 +106,11 @@ def parse_currency_input(raw: str) -> float:
 def render_currency_input(label: str, value: float, key: str):
     """텍스트 입력으로 통화 입력 UX 제공 (쉼표 자동 포맷)."""
     formatted_default = f"{int(value):,}" if value is not None else ""
-    typed = st.text_input(label, value=formatted_default, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
+    # Streamlit 제약: 세션 상태로 값을 넣은 위젯은 value 파라미터를 함께 주면 경고가 발생한다.
+    if key in st.session_state:
+        typed = st.text_input(label, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
+    else:
+        typed = st.text_input(label, value=formatted_default, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
     cleaned_val = parse_currency_input(typed)
     pretty = f"{int(cleaned_val):,}원" if cleaned_val else "0원"
     st.caption(f"입력값: {pretty}")
