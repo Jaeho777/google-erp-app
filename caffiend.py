@@ -152,6 +152,42 @@ def get_recent_sales_entries(df_source: pd.DataFrame, limit: int = 3):
 
 st.set_page_config(page_title="☕ Coffee ERP Dashboard", layout="wide")
 
+# === 글로벌 글자 크기 설정 ===
+# 기본값을 1.1로 조정하고 단계별 배율도 함께 조정
+FONT_SCALE_MAP = {"기본": 1.1, "크게": 1.2, "매우 크게": 1.35}
+st.session_state.setdefault("font_scale_label", "기본")
+font_scale = FONT_SCALE_MAP.get(st.session_state.get("font_scale_label", "기본"), 1.0)
+st.markdown(
+    f"""
+    <style>
+    :root {{ --base-font-scale: {font_scale}; }}
+    html, body, [data-testid="stAppViewContainer"] *, [data-testid="stSidebar"] * {{
+        font-size: calc(16px * var(--base-font-scale));
+    }}
+    [data-testid="stMetricValue"], [data-testid="stMetricDelta"] {{
+        font-size: calc(24px * var(--base-font-scale));
+    }}
+    /* 제목은 기본 크기 유지 */
+    h1, h2, h3 {{
+        font-size: revert;
+    }}
+    /* 대시보드 타이틀/섹션 헤더는 작게(0.9배) */
+    h1, h2, h3, h4, h5 {{
+        font-size: calc(1em * 0.9);
+    }}
+    /* 대시보드/홈 타이틀은 크게 (2.0배) */
+    .dashboard-header h1 {{
+        font-size: 2em !important;
+    }}
+    .home-title {{
+        font-size: 2em !important;
+        margin: 0 0 12px 0;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # (init_firebase 함수 원본)
 def init_firebase():
@@ -1943,7 +1979,7 @@ menu = st.session_state.current_page
 # 🏠 홈 (메인 화면)
 # ==============================================================
 if menu == "홈":
-    st.header("🏠 비즈니스 관리 시스템")
+    st.markdown("<h1 class='home-title'>🏠 비즈니스 관리 시스템</h1>", unsafe_allow_html=True)
     st.write("원하시는 메뉴를 선택해주세요.")
     
     # CSS 스타일 (버튼 높이 및 텍스트) - (기존 코드와 동일)
@@ -2015,6 +2051,10 @@ if menu == "홈":
                     use_container_width=True,
                 )
                 st.markdown(f"<div class='home-desc'>{desc}</div>", unsafe_allow_html=True)
+
+    # 추가 기능 아래 별도 드롭다운으로 보기 설정 노출
+    with st.expander("👀 보기 설정", expanded=False):
+        st.radio("글자 크기", list(FONT_SCALE_MAP.keys()), horizontal=True, key="font_scale_label")
 
 # ==============================================================
 # 🧾 거래 추가 (버튼 가시성 향상을 위해 수정된 예시)
