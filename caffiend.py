@@ -106,7 +106,11 @@ def parse_currency_input(raw: str) -> float:
 def render_currency_input(label: str, value: float, key: str):
     """텍스트 입력으로 통화 입력 UX 제공 (쉼표 자동 포맷)."""
     formatted_default = f"{int(value):,}" if value is not None else ""
-    typed = st.text_input(label, value=formatted_default, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
+    # Streamlit 제약: 세션 상태로 값을 넣은 위젯은 value 파라미터를 함께 주면 경고가 발생한다.
+    if key in st.session_state:
+        typed = st.text_input(label, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
+    else:
+        typed = st.text_input(label, value=formatted_default, key=key, help="숫자만 입력하면 자동으로 원 단위를 맞춥니다.")
     cleaned_val = parse_currency_input(typed)
     pretty = f"{int(cleaned_val):,}원" if cleaned_val else "0원"
     st.caption(f"입력값: {pretty}")
@@ -147,6 +151,42 @@ def get_recent_sales_entries(df_source: pd.DataFrame, limit: int = 3):
         return []
 
 st.set_page_config(page_title="☕ Coffee ERP Dashboard", layout="wide")
+
+# === 글로벌 글자 크기 설정 ===
+# 기본값을 1.1로 조정하고 단계별 배율도 함께 조정
+FONT_SCALE_MAP = {"기본": 1.1, "크게": 1.2, "매우 크게": 1.35}
+st.session_state.setdefault("font_scale_label", "기본")
+font_scale = FONT_SCALE_MAP.get(st.session_state.get("font_scale_label", "기본"), 1.0)
+st.markdown(
+    f"""
+    <style>
+    :root {{ --base-font-scale: {font_scale}; }}
+    html, body, [data-testid="stAppViewContainer"] *, [data-testid="stSidebar"] * {{
+        font-size: calc(16px * var(--base-font-scale));
+    }}
+    [data-testid="stMetricValue"], [data-testid="stMetricDelta"] {{
+        font-size: calc(24px * var(--base-font-scale));
+    }}
+    /* 제목은 기본 크기 유지 */
+    h1, h2, h3 {{
+        font-size: revert;
+    }}
+    /* 대시보드 타이틀/섹션 헤더는 작게(0.9배) */
+    h1, h2, h3, h4, h5 {{
+        font-size: calc(1em * 0.9);
+    }}
+    /* 대시보드/홈 타이틀은 크게 (2.0배) */
+    .dashboard-header h1 {{
+        font-size: 2em !important;
+    }}
+    .home-title {{
+        font-size: 2em !important;
+        margin: 0 0 12px 0;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # (init_firebase 함수 원본)
@@ -1156,6 +1196,24 @@ except Exception as e:
     #data_load_state.error(f"데이터 로드 실패: {e}")
     st.stop()
     
+# --- 공통 메뉴 옵션 헬퍼 ---
+def get_menu_options(df_sales: pd.DataFrame, df_inventory: pd.DataFrame) -> list[str]:
+    """판매 기록과 재고(완제품) 기준으로 노출할 메뉴 옵션을 동적으로 만든다."""
+    options = set()
+    try:
+        if "상품상세" in df_sales.columns:
+            options |= {to_korean_detail(str(x)) for x in df_sales["상품상세"].dropna().unique()}
+    except Exception:
+        pass
+    try:
+        if not df_inventory.empty:
+            menu_rows = df_inventory[df_inventory["is_ingredient"] == False]
+            options |= {to_korean_detail(str(x)) for x in menu_rows["상품상세"].dropna().unique()}
+    except Exception:
+        pass
+    if not options:
+        options |= set(MENU_MASTER_KR) | set(SEED_MENUS)
+    return sorted(options)
 
 # --- 6. 원가(COGS) 계산 함수 (정의 4) ---
 @st.cache_data(ttl=600)
@@ -1921,7 +1979,7 @@ menu = st.session_state.current_page
 # 🏠 홈 (메인 화면)
 # ==============================================================
 if menu == "홈":
-    st.header("🏠 비즈니스 관리 시스템")
+    st.markdown("<h1 class='home-title'>🏠 비즈니스 관리 시스템</h1>", unsafe_allow_html=True)
     st.write("원하시는 메뉴를 선택해주세요.")
     
     # CSS 스타일 (버튼 높이 및 텍스트) - (기존 코드와 동일)
@@ -1993,6 +2051,10 @@ if menu == "홈":
                     use_container_width=True,
                 )
                 st.markdown(f"<div class='home-desc'>{desc}</div>", unsafe_allow_html=True)
+
+    # 추가 기능 아래 별도 드롭다운으로 보기 설정 노출
+    with st.expander("👀 보기 설정", expanded=False):
+        st.radio("글자 크기", list(FONT_SCALE_MAP.keys()), horizontal=True, key="font_scale_label")
 
 # ==============================================================
 # 🧾 거래 추가 (버튼 가시성 향상을 위해 수정된 예시)
@@ -2131,7 +2193,6 @@ if menu == "거래 추가":
             .reset_index()
             .sort_values("수량", ascending=False)
         )
-        best_df = best_df[best_df["상품상세"].isin(MENU_MASTER_KR)]
         best_cards = best_df.head(7).to_dict("records")
     except Exception:
         best_cards = []
@@ -2169,7 +2230,9 @@ if menu == "거래 추가":
         st.session_state.setdefault("order_cat", prefill.get("상품카테고리"))
         st.session_state.setdefault("order_detail", prefill.get("상품상세"))
     # 메뉴 선택만 노출 (카테고리는 자동 추론)
-    detail_options = MENU_MASTER_KR
+    detail_options = get_menu_options(df, df_inv)
+    if prefill and prefill.get("상품상세") and prefill.get("상품상세") not in detail_options:
+        detail_options = [prefill.get("상품상세")] + detail_options
     상품상세_ko = choose_option("메뉴 선택", detail_options, key="order_detail", placeholder="메뉴를 선택하세요...")
     if prefill and 상품상세_ko != prefill.get("상품상세"):
         st.session_state.prefill_from_history = False
@@ -3755,10 +3818,88 @@ elif menu == "AI 비서":
 # === [UX 개선] tab2(기능 중복) 삭제, '수익' 자동계산, 삭제 UI 간소화 ===
 # ==============================================================
 elif menu == "데이터 편집":
-    # [수정] 헤더를 '거래 수정/삭제'로 명확히 함
-    st.header("✏️ 거래 수정/삭제")
+    # [수정] 헤더를 통합 편집으로 변경
+    st.header("✏️ 데이터 편집")
     
-    # [수정] tab1, tab2 구분 삭제
+    # 메뉴 구성 관리 (사용자 추가/삭제)
+    st.subheader("🍽️ 메뉴 구성 관리")
+    st.caption("메뉴/레시피만 넣으면 바로 돌아가도록, 메뉴를 직접 추가·삭제할 수 있습니다.")
+
+    menu_df_edit = df_inv[df_inv["is_ingredient"] == False].copy()
+    menu_cols = ["상품상세", "uom", "현재재고"]
+    menu_cols = [c for c in menu_cols if c in menu_df_edit.columns]
+
+    if menu_df_edit.empty:
+        st.info("등록된 메뉴가 없습니다. 아래에서 신규 메뉴를 추가해주세요.")
+    else:
+        st.dataframe(
+            menu_df_edit[menu_cols].sort_values("상품상세"),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with st.form("menu_add_form"):
+        menu_label = st.text_input("메뉴명 (표시용)", placeholder="예: 헤이즐넛 아메리카노 I")
+        menu_uom = st.selectbox("단위", ["ea", "g", "ml"], index=0, help="잔 단위는 ea, 재료형 메뉴는 g/ml")
+        init_stock = st.number_input("초기 재고(신규 메뉴용)", min_value=0, value=int(DEFAULT_INITIAL_STOCK))
+        submit_menu = st.form_submit_button("메뉴 추가/업데이트")
+
+    if submit_menu:
+        clean_name = menu_label.strip()
+        if not clean_name:
+            st.warning("메뉴명을 입력해주세요.")
+        else:
+            menu_en = from_korean_detail(clean_name)
+            doc_id = safe_doc_id(menu_en)
+            ref = db.collection(INVENTORY_COLLECTION).document(doc_id)
+            snap = ref.get()
+
+            base_fields = {
+                "상품상세_en": menu_en,
+                "상품상세": clean_name,
+                "is_ingredient": False,
+                "uom": normalize_uom(menu_uom),
+                "supply_mode": DEFAULT_SUPPLY_MODE,
+                "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
+            }
+            if snap.exists:
+                ref.update(base_fields)
+                st.success(f"✅ '{clean_name}' 메뉴 정보를 업데이트했습니다. (재고는 유지)")
+            else:
+                ref.set({
+                    **base_fields,
+                    "초기재고": init_stock,
+                    "현재재고": init_stock,
+                    "cost_unit_size": 1.0,
+                    "cost_per_unit": 0.0,
+                    "unit_cost": 0.0,
+                })
+                st.success(f"✅ '{clean_name}' 메뉴를 추가했습니다.")
+
+            clear_cache_safe(load_all_core_data, load_inventory_df)
+            safe_rerun()
+
+    if not menu_df_edit.empty:
+        st.markdown("---")
+        del_targets = st.multiselect("삭제할 메뉴 선택", menu_df_edit["상품상세"].tolist(), key="menu_delete_select")
+        if st.button("선택 메뉴 삭제", use_container_width=True, disabled=not del_targets):
+            removed = 0
+            for name in del_targets:
+                try:
+                    doc_id = safe_doc_id(from_korean_detail(name))
+                    db.collection(INVENTORY_COLLECTION).document(doc_id).delete()
+                    removed += 1
+                except Exception as e:
+                    st.warning(f"'{name}' 삭제 실패: {e}")
+            if removed:
+                st.success(f"🗑️ {removed}개 메뉴를 삭제했습니다. (기존 판매 데이터는 유지)")
+                clear_cache_safe(load_all_core_data, load_inventory_df)
+                safe_rerun()
+            else:
+                st.info("삭제된 메뉴가 없습니다.")
+
+    st.markdown("---")
+    st.subheader("🧾 거래 수정/삭제")
     
     df_raw, df_view = load_sales_with_id()
     if df_view.empty:
