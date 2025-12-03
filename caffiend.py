@@ -23,6 +23,13 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import textwrap
 
+from pricing_fetch import (
+    fetch_kamis_prices,
+    fetch_naver_prices,
+    load_mapping,
+    merge_price_rows,
+)
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -221,6 +228,17 @@ try:
     SECRETS = dict(st.secrets)
 except Exception:
     SECRETS = {}
+
+
+def get_secret(key: str, default=None):
+    """환경변수와 st.secrets를 모두 확인하여 값을 가져옵니다."""
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.environ.get(key, default)
+
 
 def _resolve_path(val, default: Path) -> Path:
     if not val:
@@ -3221,13 +3239,14 @@ elif menu == "재고 관리":
     else:
         st.info("판매/레시피 데이터가 부족해 소진 예정일을 계산할 수 없습니다. 거래 추가 및 레시피 등록 후 재고 관리 탭을 다시 확인하세요.")
     
-    # 탭 재구성: 재고 입력 → 요약 → AI → 원가/재료 → 레시피
-    tab_inv_input, tab_summary, tab_ai, tab_cost , tab_recipe= st.tabs([
+    # 탭 재구성: 재고 입력 → 요약 → 시세 → AI → 원가/재료 → 레시피
+    tab_inv_input, tab_summary, tab_price, tab_ai, tab_cost, tab_recipe = st.tabs([
         "📸 재고 입력",
         "📦 재고 요약",
+        "💸 원재료 시세",
         "🤖 AI 영향도",
         "📊 재료/원가 마스터",
-        "📜 레시피 편집기 (BOM)"
+        "📜 레시피 편집기 (BOM)",
     ])
 
     # 재고 요약 탭
@@ -3249,7 +3268,117 @@ elif menu == "재고 관리":
                         - 판매 가능 일수: {r['판매 가능 일수']}일 ({r['D-day']})
                         - 발주 추천일: {order_txt} (리드타임 {lead_txt}, 공급 방식: {r['supply_mode']})
                         """
-                    )
+                        )
+
+    # 원재료 시세 탭
+    with tab_price:
+        st.subheader("💸 원재료 시세 비교")
+
+        mapping_rows = load_mapping(DATA_DIR / "price_mapping.csv")
+        if not mapping_rows:
+            st.warning("`data/price_mapping.csv`에 품목, 검색어, KAMIS 코드를 추가해 주세요.")
+            st.code(
+                "item,search_keyword,kamis_code,unit\n"
+                "우유 1L,서울우유 1L,,1L\n"
+                "원두 1kg,원두 1kg 스페셜티,,1kg\n"
+                "휘핑크림 1L,앵커 휘핑크림 1L,,1L",
+                language="text",
+            )
+        else:
+            options = [
+                r.get("item") or r.get("search_keyword")
+                for r in mapping_rows
+                if (r.get("item") or r.get("search_keyword"))
+            ]
+            selected_item = st.selectbox("비교할 품목", options, key="price_item_select")
+
+            if st.session_state.get("price_selected_item") != selected_item:
+                st.session_state.price_selected_item = selected_item
+                st.session_state.price_rows = None
+                st.session_state.price_notes = []
+
+            target = next(
+                (r for r in mapping_rows if (r.get("item") or r.get("search_keyword")) == selected_item),
+                None,
+            )
+
+            if target:
+                search_kw = str(target.get("search_keyword", "")).strip()
+                kamis_code = str(target.get("kamis_code", "")).strip()
+                unit = str(target.get("unit", "")).strip()
+                st.caption(f"검색어: {search_kw or '입력 필요'} · KAMIS 코드: {kamis_code or '없음'} · 단위: {unit or '-'}")
+
+                naver_id = get_secret("NAVER_CLIENT_ID")
+                naver_secret = get_secret("NAVER_CLIENT_SECRET")
+                kamis_id = get_secret("KAMIS_ID")
+                kamis_key = get_secret("KAMIS_KEY")
+
+                st.caption(
+                    f"키 상태 · NAVER: {'✅' if naver_id and naver_secret else '❌ 없음'} / "
+                    f"KAMIS: {'✅' if kamis_id and kamis_key else '❌ 없음'}"
+                )
+
+                if st.button("시세 불러오기", key="btn_fetch_price"):
+                    rows_all = []
+                    notes = []
+
+                    n_rows, n_err = fetch_naver_prices(search_kw, naver_id, naver_secret, limit=12)
+                    rows_all = merge_price_rows(rows_all, n_rows)
+                    if n_err:
+                        notes.append(n_err)
+
+                    if kamis_code:
+                        k_rows, k_err = fetch_kamis_prices(kamis_code, kamis_id, kamis_key)
+                        rows_all = merge_price_rows(rows_all, k_rows)
+                        if k_err:
+                            notes.append(k_err)
+                    else:
+                        st.caption("KAMIS 코드가 없어 공공데이터 조회는 건너뜁니다.")
+
+                    st.session_state.price_rows = rows_all
+                    st.session_state.price_notes = notes
+
+                for msg in st.session_state.get("price_notes") or []:
+                    st.warning(msg)
+
+                rows = st.session_state.get("price_rows") or []
+                if rows:
+                    df_prices = pd.DataFrame(rows)
+                    if not df_prices.empty:
+                        df_prices["price"] = pd.to_numeric(df_prices["price"], errors="coerce")
+                        df_prices = df_prices[df_prices["price"] > 0]
+                        df_prices["title"] = df_prices["title"].apply(
+                            lambda x: re.sub(r"<.*?>", "", str(x or ""))
+                        )
+                        for col in ["source", "title", "price", "market", "link"]:
+                            if col not in df_prices.columns:
+                                df_prices[col] = None
+
+                    if df_prices.empty:
+                        st.info("가격 데이터를 불러오지 못했습니다. 검색어/코드나 API 키를 확인해 주세요.")
+                    else:
+                        best = df_prices.sort_values("price").iloc[0]
+                        avg_price = df_prices["price"].mean()
+                        c1, c2 = st.columns(2)
+                        c1.metric("최저가", format_krw(best["price"]), f"{best.get('source', '')}")
+                        c2.metric("평균가", format_krw(avg_price))
+
+                        st.dataframe(
+                            df_prices.sort_values("price")[
+                                ["source", "title", "price", "market", "link"]
+                            ].rename(
+                                columns={
+                                    "source": "출처",
+                                    "title": "상품명",
+                                    "price": "가격",
+                                    "market": "시장/판매처",
+                                    "link": "링크",
+                                }
+                            ),
+                            use_container_width=True,
+                        )
+                else:
+                    st.info("시세를 불러오려면 위 버튼을 눌러주세요.")
 
     # AI 영향도 탭
     with tab_ai:
