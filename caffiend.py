@@ -23,12 +23,7 @@ from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import textwrap
 
-from pricing_fetch import (
-    fetch_kamis_prices,
-    fetch_naver_prices,
-    load_mapping,
-    merge_price_rows,
-)
+from pricing_fetch import fetch_naver_prices, load_mapping, merge_price_rows
 
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -68,7 +63,7 @@ def safe_rerun():
 # ===================================================================
 
 # UX/비즈니스 로직에 필요한 상수/도우미
-SUPPLY_MODES = ["쿠팡/네이버 주문", "거래처 도매 발주", "전화/직접 방문"]
+SUPPLY_MODES = ["", "거래처 도매 발주", "전화/직접 방문"]
 DEFAULT_SUPPLY_MODE = SUPPLY_MODES[0]
 DEFAULT_SUPPLY_LEAD_DAYS = 2
 DEFAULT_GRAMS_PER_CUP = 15.0  # g 단위 재고를 잔(컵)으로 환산할 때 사용
@@ -235,6 +230,13 @@ def get_secret(key: str, default=None):
     try:
         if key in st.secrets:
             return st.secrets[key]
+        # naver 키가 [naver] 섹션에 있을 때 처리
+        if key.startswith("NAVER_") and "naver" in st.secrets:
+            sub = st.secrets["naver"]
+            if key == "NAVER_CLIENT_ID" and "client_id" in sub:
+                return sub["client_id"]
+            if key == "NAVER_CLIENT_SECRET" and "client_secret" in sub:
+                return sub["client_secret"]
     except Exception:
         pass
     return os.environ.get(key, default)
@@ -3233,24 +3235,33 @@ elif menu == "재고 관리":
         lead_txt = f"{lead_days_val:.0f}일 리드타임" if math.isfinite(lead_days_val) else "리드타임 미설정"
         st.success(
             f"대표님, 오늘({today_txt}) 기준 **{target['상품상세']}** 소진 예상 {target['D-day']} "
-            f"(약 {target['판매 가능 일수']:.1f}일 후) · 발주 추천: **{order_txt}** · 공급: {target.get('supply_mode','미설정')} ({lead_txt})"
+            f"(약 {target['판매 가능 일수']:.1f}일 후))"
         )
         st.info("제안: 재고 요약/AI 영향도 탭에서 권장발주와 커버일수를 확인하고, 재고 입력 탭에서 즉시 반영하세요.")
     else:
         st.info("판매/레시피 데이터가 부족해 소진 예정일을 계산할 수 없습니다. 거래 추가 및 레시피 등록 후 재고 관리 탭을 다시 확인하세요.")
     
-    # 탭 재구성: 재고 입력 → 요약 → 시세 → AI → 원가/재료 → 레시피
-    tab_inv_input, tab_summary, tab_price, tab_ai, tab_cost, tab_recipe = st.tabs([
+    tab_labels = [
+        "💸 원재료 시세",
         "📸 재고 입력",
         "📦 재고 요약",
-        "💸 원재료 시세",
         "🤖 AI 영향도",
         "📊 재료/원가 마스터",
         "📜 레시피 편집기 (BOM)",
-    ])
+    ]
+    st.session_state.setdefault("inv_active_tab", tab_labels[0])
+    active_idx = tab_labels.index(st.session_state.get("inv_active_tab", tab_labels[0]))
+    selected_tab = st.radio(
+        "탭 선택",
+        tab_labels,
+        horizontal=True,
+        index=active_idx,
+        key="inv_tab_radio",
+    )
+    st.session_state.inv_active_tab = selected_tab
 
     # 재고 요약 탭
-    with tab_summary:
+    if selected_tab == "📦 재고 요약":
         st.subheader("주요 재고 현황 (잔/개 단위로 직관적으로)")
         st.dataframe(summary_table, use_container_width=True)
         if not ing_usage_view.empty:
@@ -3271,28 +3282,24 @@ elif menu == "재고 관리":
                         )
 
     # 원재료 시세 탭
-    with tab_price:
+    if selected_tab == "💸 원재료 시세":
         st.subheader("💸 원재료 시세 비교")
 
         mapping_rows = load_mapping(DATA_DIR / "price_mapping.csv")
-        if not mapping_rows:
-            st.warning("`data/price_mapping.csv`에 품목, 검색어, KAMIS 코드를 추가해 주세요.")
-            st.code(
-                "item,search_keyword,kamis_code,unit\n"
-                "우유 1L,서울우유 1L,,1L\n"
-                "원두 1kg,원두 1kg 스페셜티,,1kg\n"
-                "휘핑크림 1L,앵커 휘핑크림 1L,,1L",
-                language="text",
-            )
-        else:
+        search_kw_default = ""
+        unit = ""
+        selected_item: str | None = None
+
+        if mapping_rows:
             options = [
                 r.get("item") or r.get("search_keyword")
                 for r in mapping_rows
                 if (r.get("item") or r.get("search_keyword"))
             ]
-            selected_item = st.selectbox("비교할 품목", options, key="price_item_select")
+            selected_item = st.selectbox("비교할 품목(선택은 옵션)", options, key="price_item_select")
 
-            if st.session_state.get("price_selected_item") != selected_item:
+            changed_selection = st.session_state.get("price_selected_item") != selected_item
+            if changed_selection:
                 st.session_state.price_selected_item = selected_item
                 st.session_state.price_rows = None
                 st.session_state.price_notes = []
@@ -3301,87 +3308,112 @@ elif menu == "재고 관리":
                 (r for r in mapping_rows if (r.get("item") or r.get("search_keyword")) == selected_item),
                 None,
             )
-
             if target:
-                search_kw = str(target.get("search_keyword", "")).strip()
-                kamis_code = str(target.get("kamis_code", "")).strip()
+                search_kw_default = str(target.get("search_keyword", "")).strip()
                 unit = str(target.get("unit", "")).strip()
-                st.caption(f"검색어: {search_kw or '입력 필요'} · KAMIS 코드: {kamis_code or '없음'} · 단위: {unit or '-'}")
+                st.caption(f"추천 검색어: {search_kw_default or '입력 필요'} · 단위: {unit or '-'}")
+                if changed_selection:
+                    st.session_state.price_manual_kw = search_kw_default
+        else:
+            st.warning("`data/price_mapping.csv`에 품목과 검색어를 추가해 주세요.")
+            st.code(
+                "item,search_keyword,unit\n"
+                "우유 1L,서울우유 1L,1L\n"
+                "원두 1kg,원두 1kg 스페셜티,1kg\n"
+                "휘핑크림 1L,앵커 휘핑크림 1L,1L",
+                language="text",
+            )
 
-                naver_id = get_secret("NAVER_CLIENT_ID")
-                naver_secret = get_secret("NAVER_CLIENT_SECRET")
-                kamis_id = get_secret("KAMIS_ID")
-                kamis_key = get_secret("KAMIS_KEY")
+        # 검색어 직접 입력 (선택값을 기본값으로 자동 채움)
+        if "price_manual_kw" not in st.session_state:
+            st.session_state.price_manual_kw = search_kw_default
+        # 선택 변경 시 입력값도 최신 기본값으로 덮어쓰기
+        if search_kw_default and selected_item and st.session_state.get("price_selected_item") == selected_item:
+            if st.session_state.price_manual_kw in {"", None}:
+                st.session_state.price_manual_kw = search_kw_default
 
-                st.caption(
-                    f"키 상태 · NAVER: {'✅' if naver_id and naver_secret else '❌ 없음'} / "
-                    f"KAMIS: {'✅' if kamis_id and kamis_key else '❌ 없음'}"
+        search_kw_input = st.text_input(
+            "검색어 직접 입력",
+            key="price_manual_kw",
+            placeholder="예: 딸기 1kg, 계피 스틱 1kg",
+        )
+        search_kw = (search_kw_input or "").strip() or search_kw_default
+        if search_kw_default and not search_kw_input:
+            st.caption(f"미입력 시 추천 검색어 사용: {search_kw_default}")
+
+        naver_id = get_secret("NAVER_CLIENT_ID")
+        naver_secret = get_secret("NAVER_CLIENT_SECRET")
+        st.caption(f"키 상태 · NAVER: {'✅' if naver_id and naver_secret else '❌ 없음'}")
+
+        if st.button("시세 불러오기", key="btn_fetch_price"):
+            rows_all = []
+            notes = []
+            if not search_kw:
+                notes.append("검색어를 입력해 주세요.")
+            else:
+                n_rows, n_err = fetch_naver_prices(search_kw, naver_id, naver_secret, limit=1000)
+                rows_all = merge_price_rows(rows_all, n_rows)
+                if n_err:
+                    notes.append(n_err)
+
+            st.session_state.price_rows = rows_all
+            st.session_state.price_notes = notes
+
+        for msg in st.session_state.get("price_notes") or []:
+            st.warning(msg)
+
+        rows = st.session_state.get("price_rows") or []
+        if rows:
+            df_prices = pd.DataFrame(rows)
+            if not df_prices.empty:
+                df_prices["price"] = pd.to_numeric(df_prices["price"], errors="coerce")
+                df_prices = df_prices[df_prices["price"] > 0]
+                df_prices["title"] = df_prices["title"].apply(
+                    lambda x: re.sub(r"<.*?>", "", str(x or ""))
+                )
+                # 관련도 점수 우선 정렬
+                sort_cols = ["match_score", "price"] if "match_score" in df_prices.columns else ["price"]
+                df_prices = df_prices.sort_values(sort_cols, ascending=[False, True])
+                for col in ["source", "title", "price", "market", "link"]:
+                    if col not in df_prices.columns:
+                        df_prices[col] = None
+
+            if df_prices.empty:
+                st.info("가격 데이터를 불러오지 못했습니다. 검색어/코드나 API 키를 확인해 주세요.")
+            else:
+                best = df_prices.sort_values("price").iloc[0]
+                avg_price = df_prices["price"].mean()
+                c1, c2 = st.columns(2)
+                c1.metric("최저가", format_krw(best["price"]), f"{best.get('source', '')}")
+                c2.metric("평균가", format_krw(avg_price))
+
+                if "link" in df_prices.columns:
+                    df_prices["링크"] = df_prices["link"].apply(lambda url: url if isinstance(url, str) else None)
+
+                display_df = df_prices.sort_values("price")[
+                    ["source", "title", "price", "market", "링크"]
+                ].rename(
+                    columns={
+                        "source": "출처",
+                        "title": "상품명",
+                        "price": "가격",
+                        "market": "시장/판매처",
+                        "링크": "링크",
+                    }
                 )
 
-                if st.button("시세 불러오기", key="btn_fetch_price"):
-                    rows_all = []
-                    notes = []
-
-                    n_rows, n_err = fetch_naver_prices(search_kw, naver_id, naver_secret, limit=12)
-                    rows_all = merge_price_rows(rows_all, n_rows)
-                    if n_err:
-                        notes.append(n_err)
-
-                    if kamis_code:
-                        k_rows, k_err = fetch_kamis_prices(kamis_code, kamis_id, kamis_key)
-                        rows_all = merge_price_rows(rows_all, k_rows)
-                        if k_err:
-                            notes.append(k_err)
-                    else:
-                        st.caption("KAMIS 코드가 없어 공공데이터 조회는 건너뜁니다.")
-
-                    st.session_state.price_rows = rows_all
-                    st.session_state.price_notes = notes
-
-                for msg in st.session_state.get("price_notes") or []:
-                    st.warning(msg)
-
-                rows = st.session_state.get("price_rows") or []
-                if rows:
-                    df_prices = pd.DataFrame(rows)
-                    if not df_prices.empty:
-                        df_prices["price"] = pd.to_numeric(df_prices["price"], errors="coerce")
-                        df_prices = df_prices[df_prices["price"] > 0]
-                        df_prices["title"] = df_prices["title"].apply(
-                            lambda x: re.sub(r"<.*?>", "", str(x or ""))
-                        )
-                        for col in ["source", "title", "price", "market", "link"]:
-                            if col not in df_prices.columns:
-                                df_prices[col] = None
-
-                    if df_prices.empty:
-                        st.info("가격 데이터를 불러오지 못했습니다. 검색어/코드나 API 키를 확인해 주세요.")
-                    else:
-                        best = df_prices.sort_values("price").iloc[0]
-                        avg_price = df_prices["price"].mean()
-                        c1, c2 = st.columns(2)
-                        c1.metric("최저가", format_krw(best["price"]), f"{best.get('source', '')}")
-                        c2.metric("평균가", format_krw(avg_price))
-
-                        st.dataframe(
-                            df_prices.sort_values("price")[
-                                ["source", "title", "price", "market", "link"]
-                            ].rename(
-                                columns={
-                                    "source": "출처",
-                                    "title": "상품명",
-                                    "price": "가격",
-                                    "market": "시장/판매처",
-                                    "link": "링크",
-                                }
-                            ),
-                            use_container_width=True,
-                        )
-                else:
-                    st.info("시세를 불러오려면 위 버튼을 눌러주세요.")
+                st.dataframe(
+                    display_df,
+                    use_container_width=True,
+                    column_config={
+                        "링크": st.column_config.LinkColumn("링크", display_text="열기"),
+                    },
+                )
+        else:
+            st.info("시세를 불러오려면 검색어 입력 후 버튼을 눌러주세요.")
 
     # AI 영향도 탭
-    with tab_ai:
+    if selected_tab == "🤖 AI 영향도":
         st.subheader("🤖 메뉴별 재고 영향도 분석 (AI 예측)")
         menu_list_kr = MENU_MASTER_KR
         selected_menu_kr = st.selectbox("분석할 메뉴를 선택하세요", menu_list_kr, key="inv_ai_menu")
@@ -3419,7 +3451,7 @@ elif menu == "재고 관리":
     # ==============================================================
     # TAB 2: (신규) 재료/원가 마스터
     # ==============================================================
-    with tab_cost:
+    if selected_tab == "📊 재료/원가 마스터":
         st.subheader("📊 재료/가격 설정 (쉽게 보기)")
         st.info("재료 여부, 재고, 매입가, 공급 방식을 한눈에 설정하세요.")
 
@@ -3567,7 +3599,7 @@ elif menu == "재고 관리":
     # ==============================================================
     # TAB 3: (신규) 레시피 편집기
     # ==============================================================
-    with tab_recipe:
+    if selected_tab == "📜 레시피 편집기 (BOM)":
         st.subheader("📜 메뉴별 레시피 (BOM) 편집")
         st.info("`재료/원가 마스터` 탭에서 '재료 여부'를 체크한 품목들로 레시피를 만듭니다.")
         
@@ -3700,7 +3732,7 @@ elif menu == "재고 관리":
     # ==============================================================
     # TAB 1: (신규) 재고 입력 (영수증 AI)
     # ==============================================================
-    with tab_inv_input:
+    if selected_tab == "📸 재고 입력":
         st.subheader("📸 영수증 기반 재고 입고")
         st.caption("원재료 구매 영수증을 업로드하면 AI가 자동으로 내역을 입력해줍니다.")
 
