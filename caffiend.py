@@ -191,21 +191,43 @@ st.markdown(
 )
 
 
-# (init_firebase 함수 원본)
 def init_firebase():
     try:
-        if "GOOGLE_APPLICATION_CREDENTIALS_JSON" in os.environ:
-            cred_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+        # 1순위: Streamlit Cloud Secrets 확인 (지금 설정하신 방법)
+        if "firebase_service_account" in st.secrets:
+            # Secrets 값을 딕셔너리로 가져오기
+            cred_info = dict(st.secrets["firebase_service_account"])
+            
+            # 줄바꿈 문자(\n) 에러 방지 처리 (필수)
+            if "private_key" in cred_info:
+                cred_info["private_key"] = cred_info["private_key"].replace("\\n", "\n")
+
             cred = credentials.Certificate(cred_info)
+            
+            # 앱이 초기화되지 않았을 때만 초기화
             if not firebase_admin._apps:
                 firebase_admin.initialize_app(cred)
+            
             return firestore.client(), "success"
+
+        # 2순위: 환경 변수 확인 (기존 코드 유지 - 백업용)
+        elif "GOOGLE_APPLICATION_CREDENTIALS_JSON" in os.environ:
+            cred_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+            cred = credentials.Certificate(cred_info)
+            
+            if not firebase_admin._apps:
+                firebase_admin.initialize_app(cred)
+            
+            return firestore.client(), "success"
+
+        # 3순위: 아무것도 못 찾았을 때
         else:
-            return None, "no_env"
+            return None, "no_env_or_secrets_found"
+
     except Exception as e:
         return None, f"error: {e}"
 
-# ✅ 함수 호출 후 UI 표시 분리
+# 함수 호출
 db, fb_status = init_firebase()
 
 # --- Pylance/static analyzer guards (no runtime effect) ---
