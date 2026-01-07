@@ -10,6 +10,7 @@ import re
 import warnings
 import math
 import uuid
+import difflib
 from math import ceil
 from pathlib import Path
 from datetime import datetime
@@ -810,6 +811,34 @@ def build_menu_candidates(name: str) -> set[str]:
     variants |= {to_korean_detail(v) for v in list(variants)}
     return variants
 
+def normalize_menu_key(value: str) -> str:
+    s = str(value or "").strip().lower()
+    if not s:
+        return ""
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\b(iced|ice|hot|cold|warm)\b", " ", s)
+    s = re.sub(r"\b(lg|rg|sm|large|medium|small|regular)\b", " ", s)
+    s = re.sub(r"(아이스|핫|차가운|뜨거운|라지|레귤러|스몰|대|중|소)", " ", s)
+    s = re.sub(r"i\s*/\s*h", " ", s)
+    s = re.sub(r"[(){}\[\]/\\_,.\-]+", " ", s)
+    s = re.sub(r"\s+", "", s)
+    return s
+
+def build_menu_fuzzy_index(menu_names: list[str]) -> list[tuple[str, str]]:
+    norm_map: dict[str, set[str]] = {}
+    for name in sorted(set(menu_names)):
+        if not name:
+            continue
+        for cand in {name, to_korean_detail(name), from_korean_detail(name)}:
+            norm = normalize_menu_key(cand)
+            if norm:
+                norm_map.setdefault(norm, set()).add(name)
+    index: list[tuple[str, str]] = []
+    for norm, names in norm_map.items():
+        if len(names) == 1:
+            index.append((norm, next(iter(names))))
+    return index
+
 def build_menu_lookup(menu_names: list[str]) -> dict[str, str]:
     lookup: dict[str, str] = {}
     for name in menu_names:
@@ -820,7 +849,9 @@ def build_menu_lookup(menu_names: list[str]) -> dict[str, str]:
             lookup.setdefault(compact, name)
     return lookup
 
-def match_menu_name(raw_name: str, menu_lookup: dict[str, str]) -> tuple[str, bool]:
+def match_menu_name(raw_name: str,
+                    menu_lookup: dict[str, str],
+                    fuzzy_index: list[tuple[str, str]] | None = None) -> tuple[str, bool]:
     raw = str(raw_name or "").strip()
     if not raw:
         return "", False
@@ -831,6 +862,24 @@ def match_menu_name(raw_name: str, menu_lookup: dict[str, str]) -> tuple[str, bo
     for cand in candidates:
         if cand in menu_lookup:
             return menu_lookup[cand], True
+    if fuzzy_index:
+        raw_norms = {normalize_menu_key(raw), normalize_menu_key(mapped)}
+        best_name = ""
+        best_score = 0.0
+        second_score = 0.0
+        for raw_norm in raw_norms:
+            if not raw_norm:
+                continue
+            for cand_norm, menu_name in fuzzy_index:
+                score = difflib.SequenceMatcher(None, raw_norm, cand_norm).ratio()
+                if score > best_score:
+                    second_score = best_score
+                    best_score = score
+                    best_name = menu_name
+                elif score > second_score:
+                    second_score = score
+        if best_name and best_score >= 0.86 and (best_score - second_score) >= 0.05:
+            return best_name, True
     return raw, False
 
 def normalize_column_key(value: str) -> str:
@@ -880,6 +929,51 @@ def parse_truthy(value) -> bool:
         return False
     return False
 
+def normalize_inventory_key(value: str) -> str:
+    s = str(value or "").strip().lower()
+    if not s:
+        return ""
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[(){}\[\]/\\_,.\-]+", "", s)
+    s = re.sub(r"\d+(?:\.\d+)?\s*(ml|l|kg|g|ea|개|팩|box|봉|병|pcs|pc)", "", s, flags=re.I)
+    return s
+
+def build_inventory_candidates(name: str) -> set[str]:
+    raw = str(name or "").strip()
+    if not raw:
+        return set()
+    base = {raw, apply_name_map(raw)}
+    candidates: set[str] = set()
+    for v in base:
+        if not v:
+            continue
+        candidates.add(v)
+        candidates.add(v.lower())
+        candidates.add(re.sub(r"\s+", "", v).lower())
+        candidates.add(re.sub(r"[(){}\[\]/\\_,.\-]+", "", v).lower())
+        no_unit = re.sub(r"\b\d+(?:\.\d+)?\s*(ml|l|kg|g|ea|개|팩|box|봉|병|pcs|pc)\b", "", v, flags=re.I).strip()
+        if no_unit:
+            candidates.add(no_unit)
+            candidates.add(re.sub(r"\s+", "", no_unit).lower())
+        candidates.add(to_korean_detail(v))
+        candidates.add(from_korean_detail(v))
+    candidates |= {normalize_inventory_key(v) for v in list(candidates) if v}
+    return {c for c in candidates if c}
+
+def build_inventory_fuzzy_index(df_inv: pd.DataFrame) -> list[tuple[str, str]]:
+    index: list[tuple[str, str]] = []
+    if df_inv is None or df_inv.empty:
+        return index
+    for _, row in df_inv.iterrows():
+        sku_en = str(row.get("상품상세_en") or row.get("상품상세") or "").strip()
+        if not sku_en:
+            continue
+        for name in (row.get("상품상세"), row.get("상품상세_en")):
+            norm = normalize_inventory_key(name)
+            if norm:
+                index.append((norm, sku_en))
+    return index
+
 def build_inventory_lookup(df_inv: pd.DataFrame) -> dict[str, str]:
     lookup: dict[str, str] = {}
     if df_inv is None or df_inv.empty:
@@ -887,32 +981,40 @@ def build_inventory_lookup(df_inv: pd.DataFrame) -> dict[str, str]:
     for _, row in df_inv.iterrows():
         ko = str(row.get("상품상세", "")).strip()
         en = str(row.get("상품상세_en", "")).strip()
-        keys = {
-            ko,
-            en,
-            ko.lower(),
-            en.lower(),
-            re.sub(r"\s+", "", ko).lower(),
-            re.sub(r"\s+", "", en).lower(),
-        }
+        target = en or from_korean_detail(ko) or ko
+        keys = build_inventory_candidates(ko) | build_inventory_candidates(en)
         for key in keys:
             if key:
-                lookup.setdefault(key, en or ko)
+                lookup.setdefault(key, target)
     return lookup
 
-def match_inventory_name(raw_name: str, inv_lookup: dict[str, str]) -> tuple[str, bool]:
+def match_inventory_name(raw_name: str,
+                         inv_lookup: dict[str, str],
+                         fuzzy_index: list[tuple[str, str]] | None = None) -> tuple[str, bool]:
     raw = str(raw_name or "").strip()
     if not raw:
         return "", False
-    keys = {
-        raw,
-        raw.lower(),
-        re.sub(r"\s+", "", raw).lower(),
-    }
-    for key in keys:
+    candidates = build_inventory_candidates(raw)
+    for key in candidates:
         if key in inv_lookup:
             return inv_lookup[key], True
-    return from_korean_detail(raw), False
+    if fuzzy_index:
+        raw_norm = normalize_inventory_key(raw)
+        if raw_norm:
+            best_en = ""
+            best_score = 0.0
+            second_score = 0.0
+            for cand_norm, sku_en in fuzzy_index:
+                score = difflib.SequenceMatcher(None, raw_norm, cand_norm).ratio()
+                if score > best_score:
+                    second_score = best_score
+                    best_score = score
+                    best_en = sku_en
+                elif score > second_score:
+                    second_score = score
+            if best_en and best_score >= 0.86 and (best_score - second_score) >= 0.05:
+                return best_en, True
+    return apply_name_map(from_korean_detail(raw)), False
 
 SALES_UPLOAD_ALIASES = {
     "name": ["상품상세", "상품명", "메뉴", "품목", "item", "name", "menu", "product"],
@@ -927,12 +1029,12 @@ SALES_UPLOAD_ALIASES = {
 }
 
 INVENTORY_UPLOAD_ALIASES = {
-    "name": ["상품상세", "품목", "재료", "item", "name", "material"],
-    "sku": ["상품상세_en", "sku", "sku_en"],
-    "qty": ["수량", "qty", "quantity", "입고수량", "재고"],
-    "uom": ["단위", "uom", "unit"],
+    "name": ["상품상세", "품목", "품명", "품목명", "제품명", "재료", "item", "name", "item_name", "material"],
+    "sku": ["상품상세_en", "상품코드", "sku", "sku_en", "code", "item_code"],
+    "qty": ["수량", "qty", "quantity", "입고수량", "입고량", "입고", "재고", "재고수량", "stock"],
+    "uom": ["단위", "uom", "unit", "규격"],
     "cost_unit_size": ["매입단위", "단위수량", "cost_unit_size", "unit_size"],
-    "cost_per_unit": ["매입가", "cost_per_unit", "매입가격", "price", "cost"],
+    "cost_per_unit": ["매입가", "cost_per_unit", "매입가격", "price", "cost", "unit_cost"],
     "is_ingredient": ["재료여부", "is_ingredient", "ingredient"],
 }
 
@@ -951,12 +1053,31 @@ def normalize_uom(u: Union[str, None]) -> str:
         return "ml"
     return "ea"
 
+def _uom_base_and_factor(u: Union[str, None]) -> tuple[str, float]:
+    s = (u or "").strip().lower()
+    if s in {"kg", "킬로그램"}:
+        return "g", 1000.0
+    if s in {"g", "gram", "grams", "그램"}:
+        return "g", 1.0
+    if s in {"l", "리터"}:
+        return "ml", 1000.0
+    if s in {"ml", "밀리리터"}:
+        return "ml", 1.0
+    if s in {"ea", "개", "pcs", "pc", "piece", "pieces", "팩", "봉", "병", "box"}:
+        return "ea", 1.0
+    if not s:
+        return "ea", 1.0
+    return normalize_uom(s), 1.0
+
 def convert_qty(qty: float, from_uom: str, to_uom: str) -> float:
-    fu = normalize_uom(from_uom)
-    tu = normalize_uom(to_uom)
-    if fu == tu:
+    fu, f_factor = _uom_base_and_factor(from_uom)
+    tu, t_factor = _uom_base_and_factor(to_uom)
+    if fu != tu:
         return float(qty)
-    return float(qty)
+    try:
+        return float(qty) * f_factor / t_factor
+    except Exception:
+        return float(qty)
 
 def convert_stock_to_cups(qty: float, uom: str, grams_per_cup: float = DEFAULT_GRAMS_PER_CUP) -> float:
     """g 단위를 잔(컵) 기준으로 환산."""
@@ -1628,6 +1749,108 @@ def get_menu_options(df_sales: pd.DataFrame, df_inventory: pd.DataFrame) -> list
         options |= set(MENU_MASTER_KR) | set(SEED_MENUS)
     return sorted(options)
 
+def render_menu_management(prefix: str, title: str = "🍽️ 메뉴 구성 관리"):
+    if title:
+        st.subheader(title)
+    st.caption("메뉴/레시피만 넣으면 바로 돌아가도록, 메뉴를 직접 추가·삭제할 수 있습니다.")
+
+    menu_df_edit = df_inv[df_inv["is_ingredient"] == False].copy()
+    menu_cols = ["상품상세", "uom", "현재재고"]
+    menu_cols = [c for c in menu_cols if c in menu_df_edit.columns]
+
+    if menu_df_edit.empty:
+        st.info("등록된 메뉴가 없습니다. 아래에서 신규 메뉴를 추가해주세요.")
+    else:
+        st.dataframe(
+            menu_df_edit[menu_cols].sort_values("상품상세"),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with st.form(f"{prefix}_menu_add_form"):
+        menu_label = st.text_input(
+            "메뉴명 (표시용)",
+            placeholder="예: 헤이즐넛 아메리카노 I",
+            key=f"{prefix}_menu_label",
+        )
+        menu_uom = st.selectbox(
+            "단위",
+            ["ea", "g", "ml"],
+            index=0,
+            help="잔 단위는 ea, 재료형 메뉴는 g/ml",
+            key=f"{prefix}_menu_uom",
+        )
+        init_stock = st.number_input(
+            "초기 재고(신규 메뉴용)",
+            min_value=0,
+            value=int(DEFAULT_INITIAL_STOCK),
+            key=f"{prefix}_menu_init_stock",
+        )
+        submit_menu = st.form_submit_button("메뉴 추가/업데이트")
+
+    if submit_menu:
+        clean_name = menu_label.strip()
+        if not clean_name:
+            st.warning("메뉴명을 입력해주세요.")
+        else:
+            menu_en = from_korean_detail(clean_name)
+            doc_id = safe_doc_id(menu_en)
+            ref = db.collection(INVENTORY_COLLECTION).document(doc_id)
+            snap = ref.get()
+
+            base_fields = {
+                "상품상세_en": menu_en,
+                "상품상세": clean_name,
+                "is_ingredient": False,
+                "uom": normalize_uom(menu_uom),
+                "supply_mode": DEFAULT_SUPPLY_MODE,
+                "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
+            }
+            if snap.exists:
+                ref.update(base_fields)
+                st.success(f"✅ '{clean_name}' 메뉴 정보를 업데이트했습니다. (재고는 유지)")
+            else:
+                ref.set({
+                    **base_fields,
+                    "초기재고": init_stock,
+                    "현재재고": init_stock,
+                    "cost_unit_size": 1.0,
+                    "cost_per_unit": 0.0,
+                    "unit_cost": 0.0,
+                })
+                st.success(f"✅ '{clean_name}' 메뉴를 추가했습니다.")
+
+            clear_cache_safe(load_all_core_data, load_inventory_df)
+            safe_rerun()
+
+    if not menu_df_edit.empty:
+        st.markdown("---")
+        del_targets = st.multiselect(
+            "삭제할 메뉴 선택",
+            menu_df_edit["상품상세"].tolist(),
+            key=f"{prefix}_menu_delete_select",
+        )
+        if st.button(
+            "선택 메뉴 삭제",
+            use_container_width=True,
+            disabled=not del_targets,
+            key=f"{prefix}_menu_delete_btn",
+        ):
+            removed = 0
+            for name in del_targets:
+                try:
+                    doc_id = safe_doc_id(from_korean_detail(name))
+                    db.collection(INVENTORY_COLLECTION).document(doc_id).delete()
+                    removed += 1
+                except Exception as e:
+                    st.warning(f"'{name}' 삭제 실패: {e}")
+            if removed:
+                st.success(f"🗑️ {removed}개 메뉴를 삭제했습니다. (기존 판매 데이터는 유지)")
+                clear_cache_safe(load_all_core_data, load_inventory_df)
+                safe_rerun()
+            else:
+                st.info("삭제된 메뉴가 없습니다.")
+
 # --- 6. 원가(COGS) 계산 함수 (정의 4) ---
 @st.cache_data(ttl=600)
 def calculate_menu_cogs(df_inv: pd.DataFrame, recipes: dict, cost_override: Union[dict, None] = None) -> dict:
@@ -1822,7 +2045,7 @@ def update_inventory_qty(ingredient_en: str,
             "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
         })
 
-    qty_converted = convert_qty(qty, from_uom=normalize_uom(uom), to_uom=inv_uom)
+    qty_converted = convert_qty(qty, from_uom=uom, to_uom=inv_uom)
     if mode == "set":
         new_stock = max(qty_converted, 0.0)
     else:
@@ -1928,7 +2151,8 @@ def analyze_receipt_image(uploaded_file):
 
     # 2. 프롬프트 설정 (JSON 형식 강제)
     system_prompt = """
-    You are a receipt OCR assistant. Analyze the receipt image and extract the following information in JSON format:
+    You are a receipt/POS OCR assistant. The image can be a printed receipt or a POS screen capture.
+    Analyze the image and extract the following information in JSON format:
     {
         "store_name": "Store Name",
         "date": "YYYY-MM-DD",
@@ -1940,6 +2164,7 @@ def analyze_receipt_image(uploaded_file):
         "total_amount": 5000
     }
     If date/time is missing, use null. Prices should be numbers (remove currency symbols).
+    If qty is missing but price and total exist, infer qty = total / price.
     """
 
     # 3. API 호출 (3.5 우선, 실패 시 하위 버전 폴백)
@@ -2638,8 +2863,11 @@ if menu == "거래 추가":
         st.session_state.prefill_from_history = False
     st.session_state.setdefault("order_channel", "직접입력")
 
-    st.subheader("📸 매출 영수증 기반 거래 입력")
-    st.caption("매출 영수증을 업로드하면 AI가 자동으로 거래 내역을 입력해줍니다.")
+    with st.expander("🍽️ 메뉴 편집", expanded=False):
+        render_menu_management("sales_add", title="🍽️ 메뉴 편집")
+
+    st.subheader("📸 매출 영수증/포스 화면 기반 거래 입력")
+    st.caption("매출 영수증 또는 POS 화면 캡처를 업로드하면 AI가 거래 내역을 입력해줍니다.")
 
     if "sales_receipt_result" not in st.session_state:
         st.session_state.sales_receipt_result = None
@@ -2745,6 +2973,7 @@ if menu == "거래 추가":
 
             menu_options = get_menu_options(df, df_inv)
             menu_lookup = build_menu_lookup(menu_options)
+            menu_fuzzy = build_menu_fuzzy_index(menu_options)
             unmatched = []
             saved_ids = []
             final_items = []
@@ -2754,16 +2983,22 @@ if menu == "거래 추가":
                     name = str(row.get("name", "")).strip()
                     if not name:
                         continue
-                    qty = int(safe_float(row.get("qty", 1), 1))
-                    if qty <= 0:
-                        continue
                     price = safe_float(row.get("price", 0.0), 0.0)
                     total = safe_float(row.get("total", 0.0), 0.0)
+                    qty = safe_float(row.get("qty", 0.0), 0.0)
+                    if qty <= 0:
+                        if price > 0 and total > 0:
+                            qty = total / price
+                        else:
+                            qty = 1
+                    qty = int(round(qty))
+                    if qty <= 0:
+                        continue
                     if price <= 0 and total > 0 and qty > 0:
                         price = total / qty
                     revenue = price * qty if price > 0 else total
 
-                    menu_ko, matched = match_menu_name(name, menu_lookup)
+                    menu_ko, matched = match_menu_name(name, menu_lookup, menu_fuzzy)
                     if not matched:
                         unmatched.append(name)
 
@@ -2894,6 +3129,7 @@ if menu == "거래 추가":
                     default_time = datetime.now().strftime("%H:%M:%S")
                     menu_options = get_menu_options(df, df_inv)
                     menu_lookup = build_menu_lookup(menu_options)
+                    menu_fuzzy = build_menu_fuzzy_index(menu_options)
                     unmatched = []
                     saved_ids = []
 
@@ -2903,11 +3139,17 @@ if menu == "거래 추가":
                             name = str(row.get(col_name, "")).strip()
                             if not name:
                                 continue
-                            qty = int(safe_float(row.get(col_qty, 1), 1))
-                            if qty <= 0:
-                                continue
                             price = safe_float(row.get(col_price, 0.0), 0.0) if col_price else 0.0
                             total = safe_float(row.get(col_total, 0.0), 0.0) if col_total else 0.0
+                            qty = safe_float(row.get(col_qty, 0.0), 0.0)
+                            if qty <= 0:
+                                if price > 0 and total > 0:
+                                    qty = total / price
+                                else:
+                                    qty = 1
+                            qty = int(round(qty))
+                            if qty <= 0:
+                                continue
                             if price <= 0 and total > 0 and qty > 0:
                                 price = total / qty
                             revenue = price * qty if price > 0 else total
@@ -2917,7 +3159,7 @@ if menu == "거래 추가":
                             sale_date = normalize_receipt_date(date_raw, today)
                             sale_time = normalize_receipt_time(time_raw, default_time)
 
-                            menu_ko, matched = match_menu_name(name, menu_lookup)
+                            menu_ko, matched = match_menu_name(name, menu_lookup, menu_fuzzy)
                             if not matched:
                                 unmatched.append(name)
 
@@ -4304,108 +4546,135 @@ elif menu == "재고 관리":
             st.warning("📦 마스터 목록이 비어있습니다. '동기화' 버튼을 눌러 시작하세요.")
             st.stop()
 
-        # SEED_INGREDIENTS 목록에 있는 품목만 표시/편집 (요청사항)
-        seed_names = set([item["ko"] for item in SEED_INGREDIENTS])
-        df_inv_edit = df_inv[df_inv['상품상세'].isin(seed_names)].copy()
-        df_inv_edit = df_inv_edit.sort_values('상품상세')
-        df_inv_edit['supply_mode'] = df_inv_edit['supply_mode'].fillna(DEFAULT_SUPPLY_MODE)
-        df_inv_edit['supply_lead_days'] = df_inv_edit['supply_lead_days'].fillna(DEFAULT_SUPPLY_LEAD_DAYS)
-        
-        with st.form(key="inventory_master_form"):
-            edited_inv_df = st.data_editor(
-                df_inv_edit[['상품상세', 'is_ingredient', 'uom', '현재재고', 'cost_unit_size', 'cost_per_unit', 'supply_mode', 'supply_lead_days', '상품상세_en']],
-                column_config={
-                    "상품상세": st.column_config.TextColumn("품목명", disabled=False), 
-                    "is_ingredient": st.column_config.CheckboxColumn("재료 여부 (체크)"),
-                    "uom": st.column_config.TextColumn("기본 단위", disabled=False), 
-                    "현재재고": st.column_config.NumberColumn("현재 재고(수기)", min_value=0.0, format="%.2f"),
-                    "cost_unit_size": st.column_config.NumberColumn("매입 단위(g/ml/ea)", min_value=1.0, format="%.0f"),
-                    "cost_per_unit": st.column_config.NumberColumn("매입가(원)", min_value=0, format="%d원"),
-                    "supply_mode": st.column_config.SelectboxColumn("공급 방식", options=SUPPLY_MODES),
-                    "supply_lead_days": st.column_config.NumberColumn("리드타임(일)", min_value=0.0, format="%.0f일"),
-                    "상품상세_en": st.column_config.TextColumn("SKU (Eng)", disabled=True, help="기존 품목은 SKU수정 불가, 신규 품목은 자동 생성됨"),
-                },
-                hide_index=True,
-                num_rows="fixed",  # 👈 SEED 품목만 유지 (새 행 추가 불가)
-                use_container_width=True
-            )
-            submitted_inv = st.form_submit_button("💾 '재료/원가/재고' 설정 저장하기", type="primary")
+        scope_label = st.radio(
+            "표시 범위",
+            ["전체", "재료만", "메뉴만", "시드 재료만"],
+            horizontal=True,
+            key="inv_master_scope",
+        )
+        search_kw = st.text_input(
+            "품목 검색",
+            placeholder="예: 원두, 우유",
+            key="inv_master_search",
+        )
 
-        if submitted_inv:
-            changed = 0
-            created = 0 
-            batch = db.batch()
-            original_map = df_inv.set_index('상품상세_en').to_dict('index')
+        df_inv_edit = df_inv.copy()
+        if scope_label == "재료만":
+            df_inv_edit = df_inv_edit[df_inv_edit["is_ingredient"] == True]
+        elif scope_label == "메뉴만":
+            df_inv_edit = df_inv_edit[df_inv_edit["is_ingredient"] == False]
+        elif scope_label == "시드 재료만":
+            seed_names = set([item["ko"] for item in SEED_INGREDIENTS])
+            df_inv_edit = df_inv_edit[df_inv_edit["상품상세"].isin(seed_names)]
 
-            for _, item in edited_inv_df.iterrows():
-                sku_en = item['상품상세_en']
-                
-                if pd.isna(sku_en) or not sku_en:
-                    new_sku_kr = item['상품상세']
-                    if not new_sku_kr:
-                        st.warning("새로 추가된 행의 '품목명'이 비어있어 건너뜁니다.")
-                        continue
-                    new_sku_en = from_korean_detail(new_sku_kr) 
-                    
-                    if new_sku_en in original_map:
-                        st.error(f"'{new_sku_kr}'({new_sku_en})는 이미 존재합니다. 저장을 건너뜁니다.")
-                        continue
-                        
-                    new_doc_ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(new_sku_en))
-                    batch.set(new_doc_ref, {
-                        "상품상세_en": new_sku_en,
-                        "상품상세": new_sku_kr,
-                        "is_ingredient": bool(item['is_ingredient']),
-                        "uom": normalize_uom(item['uom'] or 'ea'),
-                        "현재재고": safe_float(item['현재재고'], 0.0),
-                        "초기재고": 0.0, 
-                        "cost_unit_size": safe_float(item['cost_unit_size'], 1.0),
-                        "cost_per_unit": safe_float(item['cost_per_unit'], 0.0),
-                        "supply_mode": item.get("supply_mode") or DEFAULT_SUPPLY_MODE,
-                        "supply_lead_days": safe_float(item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS))
-                    })
-                    created += 1
-                    
-                else:
-                    orig_item = original_map.get(sku_en, {})
-                    patch = {}
-                    
-                    new_sku_kr_update = item['상품상세']
-                    if orig_item.get('상품상세', '') != new_sku_kr_update and new_sku_kr_update:
-                         patch['상품상세'] = new_sku_kr_update
-                    
-                    is_ingr_new = bool(item['is_ingredient'])
-                    if orig_item.get('is_ingredient') != is_ingr_new:
-                        patch['is_ingredient'] = is_ingr_new
-                    cost_unit_new = safe_float(item['cost_unit_size'], 1.0)
-                    if orig_item.get('cost_unit_size', 1.0) != cost_unit_new:
-                        patch['cost_unit_size'] = cost_unit_new
-                    cost_new = safe_float(item['cost_per_unit'], 0.0)
-                    if orig_item.get('cost_per_unit', 0.0) != cost_new:
-                        patch['cost_per_unit'] = cost_new
-                    stock_new = safe_float(item['현재재고'], 0.0)
-                    if orig_item.get('현재재고', 0.0) != stock_new:
-                        patch['현재재고'] = stock_new
-                    supply_mode_new = item.get("supply_mode") or DEFAULT_SUPPLY_MODE
-                    if orig_item.get("supply_mode", DEFAULT_SUPPLY_MODE) != supply_mode_new:
-                        patch["supply_mode"] = supply_mode_new
-                    lead_new = safe_float(item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS), DEFAULT_SUPPLY_LEAD_DAYS)
-                    if orig_item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS) != lead_new:
-                        patch["supply_lead_days"] = lead_new
+        if search_kw:
+            mask = df_inv_edit["상품상세"].str.contains(search_kw, case=False, na=False)
+            if "상품상세_en" in df_inv_edit.columns:
+                mask |= df_inv_edit["상품상세_en"].str.contains(search_kw, case=False, na=False)
+            df_inv_edit = df_inv_edit[mask]
 
-                    if patch: 
-                        doc_ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(sku_en))
-                        batch.update(doc_ref, patch)
-                        changed += 1
+        if df_inv_edit.empty:
+            st.info("표시할 품목이 없습니다. 필터를 변경해 주세요.")
+        else:
+            df_inv_edit = df_inv_edit.sort_values('상품상세')
+            df_inv_edit['supply_mode'] = df_inv_edit['supply_mode'].fillna(DEFAULT_SUPPLY_MODE)
+            df_inv_edit['supply_lead_days'] = df_inv_edit['supply_lead_days'].fillna(DEFAULT_SUPPLY_LEAD_DAYS)
             
-            if changed > 0 or created > 0:
-                batch.commit()
-                clear_cache_safe(load_inventory_df, load_all_core_data)
-                st.success(f"✅ {created}건 생성, {changed}건 업데이트 완료.")
-                st.balloons()
-                safe_rerun()
-            else:
-                st.info("변경된 내용이 없습니다.")
+            with st.form(key="inventory_master_form"):
+                edited_inv_df = st.data_editor(
+                    df_inv_edit[['상품상세', 'is_ingredient', 'uom', '현재재고', 'cost_unit_size', 'cost_per_unit', 'supply_mode', 'supply_lead_days', '상품상세_en']],
+                    column_config={
+                        "상품상세": st.column_config.TextColumn("품목명", disabled=False), 
+                        "is_ingredient": st.column_config.CheckboxColumn("재료 여부 (체크)"),
+                        "uom": st.column_config.TextColumn("기본 단위", disabled=False), 
+                        "현재재고": st.column_config.NumberColumn("현재 재고(수기)", min_value=0.0, format="%.2f"),
+                        "cost_unit_size": st.column_config.NumberColumn("매입 단위(g/ml/ea)", min_value=1.0, format="%.0f"),
+                        "cost_per_unit": st.column_config.NumberColumn("매입가(원)", min_value=0, format="%d원"),
+                        "supply_mode": st.column_config.SelectboxColumn("공급 방식", options=SUPPLY_MODES),
+                        "supply_lead_days": st.column_config.NumberColumn("리드타임(일)", min_value=0.0, format="%.0f일"),
+                        "상품상세_en": st.column_config.TextColumn("SKU (Eng)", disabled=True, help="기존 품목은 SKU수정 불가, 신규 품목은 자동 생성됨"),
+                    },
+                    hide_index=True,
+                    num_rows="fixed",
+                    use_container_width=True
+                )
+                submitted_inv = st.form_submit_button("💾 '재료/원가/재고' 설정 저장하기", type="primary")
+
+            if submitted_inv:
+                changed = 0
+                created = 0 
+                batch = db.batch()
+                original_map = df_inv.set_index('상품상세_en').to_dict('index')
+
+                for _, item in edited_inv_df.iterrows():
+                    sku_en = item['상품상세_en']
+                    
+                    if pd.isna(sku_en) or not sku_en:
+                        new_sku_kr = item['상품상세']
+                        if not new_sku_kr:
+                            st.warning("새로 추가된 행의 '품목명'이 비어있어 건너뜁니다.")
+                            continue
+                        new_sku_en = from_korean_detail(new_sku_kr) 
+                        
+                        if new_sku_en in original_map:
+                            st.error(f"'{new_sku_kr}'({new_sku_en})는 이미 존재합니다. 저장을 건너뜁니다.")
+                            continue
+                            
+                        new_doc_ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(new_sku_en))
+                        batch.set(new_doc_ref, {
+                            "상품상세_en": new_sku_en,
+                            "상품상세": new_sku_kr,
+                            "is_ingredient": bool(item['is_ingredient']),
+                            "uom": normalize_uom(item['uom'] or 'ea'),
+                            "현재재고": safe_float(item['현재재고'], 0.0),
+                            "초기재고": 0.0, 
+                            "cost_unit_size": safe_float(item['cost_unit_size'], 1.0),
+                            "cost_per_unit": safe_float(item['cost_per_unit'], 0.0),
+                            "supply_mode": item.get("supply_mode") or DEFAULT_SUPPLY_MODE,
+                            "supply_lead_days": safe_float(item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS))
+                        })
+                        created += 1
+                        
+                    else:
+                        orig_item = original_map.get(sku_en, {})
+                        patch = {}
+                        
+                        new_sku_kr_update = item['상품상세']
+                        if orig_item.get('상품상세', '') != new_sku_kr_update and new_sku_kr_update:
+                             patch['상품상세'] = new_sku_kr_update
+                        
+                        is_ingr_new = bool(item['is_ingredient'])
+                        if orig_item.get('is_ingredient') != is_ingr_new:
+                            patch['is_ingredient'] = is_ingr_new
+                        cost_unit_new = safe_float(item['cost_unit_size'], 1.0)
+                        if orig_item.get('cost_unit_size', 1.0) != cost_unit_new:
+                            patch['cost_unit_size'] = cost_unit_new
+                        cost_new = safe_float(item['cost_per_unit'], 0.0)
+                        if orig_item.get('cost_per_unit', 0.0) != cost_new:
+                            patch['cost_per_unit'] = cost_new
+                        stock_new = safe_float(item['현재재고'], 0.0)
+                        if orig_item.get('현재재고', 0.0) != stock_new:
+                            patch['현재재고'] = stock_new
+                        supply_mode_new = item.get("supply_mode") or DEFAULT_SUPPLY_MODE
+                        if orig_item.get("supply_mode", DEFAULT_SUPPLY_MODE) != supply_mode_new:
+                            patch["supply_mode"] = supply_mode_new
+                        lead_new = safe_float(item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS), DEFAULT_SUPPLY_LEAD_DAYS)
+                        if orig_item.get("supply_lead_days", DEFAULT_SUPPLY_LEAD_DAYS) != lead_new:
+                            patch["supply_lead_days"] = lead_new
+
+                        if patch: 
+                            doc_ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(sku_en))
+                            batch.update(doc_ref, patch)
+                            changed += 1
+                
+                if changed > 0 or created > 0:
+                    batch.commit()
+                    clear_cache_safe(load_inventory_df, load_all_core_data)
+                    st.success(f"✅ {created}건 생성, {changed}건 업데이트 완료.")
+                    st.balloons()
+                    safe_rerun()
+                else:
+                    st.info("변경된 내용이 없습니다.")
 
     # ==============================================================
     # TAB 3: (신규) 레시피 편집기
@@ -4674,6 +4943,7 @@ elif menu == "재고 관리":
                     stock_time = normalize_receipt_time(time_val, datetime.now().strftime("%H:%M:%S"))
 
                     inv_lookup = build_inventory_lookup(df_inv)
+                    inv_fuzzy = build_inventory_fuzzy_index(df_inv)
                     uom_map = {}
                     if not df_inv.empty and "상품상세_en" in df_inv.columns:
                         uom_map = df_inv.set_index("상품상세_en")["uom"].to_dict()
@@ -4687,13 +4957,15 @@ elif menu == "재고 관리":
                             name = str(row.get("name", "")).strip()
                             if not name:
                                 continue
-                            qty = safe_float(row.get("qty", 0.0), 0.0)
-                            if qty == 0:
-                                continue
                             price = safe_float(row.get("price", 0.0), 0.0)
                             total = safe_float(row.get("total", 0.0), 0.0)
+                            qty = safe_float(row.get("qty", 0.0), 0.0)
+                            if qty == 0 and price > 0 and total > 0:
+                                qty = total / price
+                            if qty == 0:
+                                qty = 1
 
-                            ingredient_en, matched = match_inventory_name(name, inv_lookup)
+                            ingredient_en, matched = match_inventory_name(name, inv_lookup, inv_fuzzy)
                             if not matched:
                                 unmatched.append(name)
 
@@ -4788,6 +5060,7 @@ elif menu == "재고 관리":
             else:
                 if st.button("💾 엑셀 재고 반영", type="primary", use_container_width=True, key="inventory_excel_save"):
                     inv_lookup = build_inventory_lookup(df_inv)
+                    inv_fuzzy = build_inventory_fuzzy_index(df_inv)
                     unmatched = []
                     updated = 0
                     upload_id = inv_excel_meta.get("upload_id") if inv_excel_meta else None
@@ -4800,7 +5073,7 @@ elif menu == "재고 관리":
                                 ingredient_en = raw_sku
                                 matched = True
                             else:
-                                ingredient_en, matched = match_inventory_name(raw_name, inv_lookup)
+                                ingredient_en, matched = match_inventory_name(raw_name, inv_lookup, inv_fuzzy)
 
                             if not ingredient_en:
                                 continue
@@ -5005,83 +5278,7 @@ elif menu == "AI 비서":
 elif menu == "데이터 편집":
     # [수정] 헤더를 통합 편집으로 변경
     st.header("✏️ 데이터 편집")
-    
-    # 메뉴 구성 관리 (사용자 추가/삭제)
-    st.subheader("🍽️ 메뉴 구성 관리")
-    st.caption("메뉴/레시피만 넣으면 바로 돌아가도록, 메뉴를 직접 추가·삭제할 수 있습니다.")
-
-    menu_df_edit = df_inv[df_inv["is_ingredient"] == False].copy()
-    menu_cols = ["상품상세", "uom", "현재재고"]
-    menu_cols = [c for c in menu_cols if c in menu_df_edit.columns]
-
-    if menu_df_edit.empty:
-        st.info("등록된 메뉴가 없습니다. 아래에서 신규 메뉴를 추가해주세요.")
-    else:
-        st.dataframe(
-            menu_df_edit[menu_cols].sort_values("상품상세"),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    with st.form("menu_add_form"):
-        menu_label = st.text_input("메뉴명 (표시용)", placeholder="예: 헤이즐넛 아메리카노 I")
-        menu_uom = st.selectbox("단위", ["ea", "g", "ml"], index=0, help="잔 단위는 ea, 재료형 메뉴는 g/ml")
-        init_stock = st.number_input("초기 재고(신규 메뉴용)", min_value=0, value=int(DEFAULT_INITIAL_STOCK))
-        submit_menu = st.form_submit_button("메뉴 추가/업데이트")
-
-    if submit_menu:
-        clean_name = menu_label.strip()
-        if not clean_name:
-            st.warning("메뉴명을 입력해주세요.")
-        else:
-            menu_en = from_korean_detail(clean_name)
-            doc_id = safe_doc_id(menu_en)
-            ref = db.collection(INVENTORY_COLLECTION).document(doc_id)
-            snap = ref.get()
-
-            base_fields = {
-                "상품상세_en": menu_en,
-                "상품상세": clean_name,
-                "is_ingredient": False,
-                "uom": normalize_uom(menu_uom),
-                "supply_mode": DEFAULT_SUPPLY_MODE,
-                "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
-            }
-            if snap.exists:
-                ref.update(base_fields)
-                st.success(f"✅ '{clean_name}' 메뉴 정보를 업데이트했습니다. (재고는 유지)")
-            else:
-                ref.set({
-                    **base_fields,
-                    "초기재고": init_stock,
-                    "현재재고": init_stock,
-                    "cost_unit_size": 1.0,
-                    "cost_per_unit": 0.0,
-                    "unit_cost": 0.0,
-                })
-                st.success(f"✅ '{clean_name}' 메뉴를 추가했습니다.")
-
-            clear_cache_safe(load_all_core_data, load_inventory_df)
-            safe_rerun()
-
-    if not menu_df_edit.empty:
-        st.markdown("---")
-        del_targets = st.multiselect("삭제할 메뉴 선택", menu_df_edit["상품상세"].tolist(), key="menu_delete_select")
-        if st.button("선택 메뉴 삭제", use_container_width=True, disabled=not del_targets):
-            removed = 0
-            for name in del_targets:
-                try:
-                    doc_id = safe_doc_id(from_korean_detail(name))
-                    db.collection(INVENTORY_COLLECTION).document(doc_id).delete()
-                    removed += 1
-                except Exception as e:
-                    st.warning(f"'{name}' 삭제 실패: {e}")
-            if removed:
-                st.success(f"🗑️ {removed}개 메뉴를 삭제했습니다. (기존 판매 데이터는 유지)")
-                clear_cache_safe(load_all_core_data, load_inventory_df)
-                safe_rerun()
-            else:
-                st.info("삭제된 메뉴가 없습니다.")
+    render_menu_management("data_edit")
 
     st.markdown("---")
     st.subheader("🧾 거래 수정/삭제")
