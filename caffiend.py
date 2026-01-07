@@ -460,6 +460,26 @@ def save_receipt_image(uploaded_file, receipt_kind: str, receipt_id: str | None 
     update_receipt_metadata(receipt_id, meta)
     return meta
 
+def build_signed_url(storage_bucket: str | None, storage_path: str | None, expires_minutes: int = 60) -> str | None:
+    if not storage_bucket or not storage_path:
+        return None
+    try:
+        bucket = storage.bucket(storage_bucket)
+        blob = bucket.blob(storage_path)
+        return blob.generate_signed_url(expiration=timedelta(minutes=expires_minutes), method="GET")
+    except Exception:
+        return None
+
+def build_storage_console_url(storage_bucket: str | None, storage_path: str | None) -> str | None:
+    if not storage_bucket or not storage_path:
+        return None
+    return f"https://console.cloud.google.com/storage/browser/_details/{storage_bucket}/{storage_path}"
+
+def build_signed_url_from_meta(meta: dict | None, expires_minutes: int = 60) -> str | None:
+    if not meta:
+        return None
+    return build_signed_url(meta.get("storage_bucket"), meta.get("storage_path"), expires_minutes)
+
 def _guess_upload_extension(uploaded_file) -> str:
     name = getattr(uploaded_file, "name", "") or ""
     ext = Path(name).suffix.lower()
@@ -2658,6 +2678,16 @@ if menu == "거래 추가":
         col_img, col_info = st.columns([1, 2])
         with col_img:
             st.image(st.session_state.sales_receipt_image, caption="원본 이미지", use_container_width=True)
+            receipt_meta = st.session_state.get("sales_receipt_meta") or {}
+            signed_url = build_signed_url_from_meta(receipt_meta)
+            console_url = build_storage_console_url(
+                receipt_meta.get("storage_bucket"),
+                receipt_meta.get("storage_path"),
+            )
+            if signed_url:
+                st.link_button("저장된 영수증 파일 열기", signed_url, use_container_width=True)
+            elif console_url:
+                st.link_button("Storage에서 보기", console_url, use_container_width=True)
             if st.button("🔄 다른 영수증 올리기", key="sales_receipt_reset"):
                 st.session_state.sales_receipt_result = None
                 st.session_state.sales_receipt_image = None
@@ -2824,6 +2854,15 @@ if menu == "거래 추가":
         )
         sales_excel_meta = save_upload_file_once(sales_excel, "sales_excel_upload", "sales_excel")
         if sales_excel_meta:
+            signed_url = build_signed_url_from_meta(sales_excel_meta)
+            console_url = build_storage_console_url(
+                sales_excel_meta.get("storage_bucket"),
+                sales_excel_meta.get("storage_path"),
+            )
+            if signed_url:
+                st.link_button("업로드 파일 열기", signed_url, use_container_width=True)
+            elif console_url:
+                st.link_button("Storage에서 보기", console_url, use_container_width=True)
             if sales_excel_meta.get("saved_storage") and sales_excel_meta.get("storage_uri"):
                 st.caption(f"Storage 저장 경로: {sales_excel_meta.get('storage_uri')}")
             elif sales_excel_meta.get("saved_local") and sales_excel_meta.get("local_path"):
@@ -4557,6 +4596,16 @@ elif menu == "재고 관리":
             
             with col_img:
                 st.image(st.session_state.receipt_image, caption="원본 이미지", use_container_width=True)
+                receipt_meta = st.session_state.get("receipt_meta") or {}
+                signed_url = build_signed_url_from_meta(receipt_meta)
+                console_url = build_storage_console_url(
+                    receipt_meta.get("storage_bucket"),
+                    receipt_meta.get("storage_path"),
+                )
+                if signed_url:
+                    st.link_button("저장된 영수증 파일 열기", signed_url, use_container_width=True)
+                elif console_url:
+                    st.link_button("Storage에서 보기", console_url, use_container_width=True)
                 if st.button("🔄 다른 영수증 올리기"):
                     st.session_state.receipt_result = None
                     st.session_state.receipt_image = None
@@ -4614,10 +4663,78 @@ elif menu == "재고 관리":
             st.markdown("---")
             btn_col1, btn_col2 = st.columns([1, 4])
             with btn_col2:
-                # [요청사항 준수] 버튼을 눌러도 아무 일도 일어나지 않음 (Print만 함)
                 if st.button("💾 DB에 저장 (재고 반영)", type="primary", use_container_width=True):
-                    st.toast("✅ (시뮬레이션) 데이터가 확인되었습니다! (현재 DB 저장 기능은 비활성화 상태입니다)")
-                    # 여기에 나중에 firebase 저장 코드를 넣으면 됩니다.
+                    receipt_meta = st.session_state.receipt_meta or {}
+                    receipt_id = receipt_meta.get("receipt_id")
+                    if not receipt_id and st.session_state.get("receipt_image") is not None:
+                        receipt_meta = save_receipt_image(st.session_state.receipt_image, "inventory")
+                        receipt_id = receipt_meta.get("receipt_id") if receipt_meta else None
+
+                    stock_date = normalize_receipt_date(date_val, datetime.now().date())
+                    stock_time = normalize_receipt_time(time_val, datetime.now().strftime("%H:%M:%S"))
+
+                    inv_lookup = build_inventory_lookup(df_inv)
+                    uom_map = {}
+                    if not df_inv.empty and "상품상세_en" in df_inv.columns:
+                        uom_map = df_inv.set_index("상품상세_en")["uom"].to_dict()
+
+                    unmatched = []
+                    updated = 0
+                    final_items = []
+
+                    with st.spinner("재고 데이터를 저장 중..."):
+                        for _, row in edited_items.iterrows():
+                            name = str(row.get("name", "")).strip()
+                            if not name:
+                                continue
+                            qty = safe_float(row.get("qty", 0.0), 0.0)
+                            if qty == 0:
+                                continue
+                            price = safe_float(row.get("price", 0.0), 0.0)
+                            total = safe_float(row.get("total", 0.0), 0.0)
+
+                            ingredient_en, matched = match_inventory_name(name, inv_lookup)
+                            if not matched:
+                                unmatched.append(name)
+
+                            uom_val = uom_map.get(ingredient_en, "ea")
+                            update_inventory_qty(
+                                ingredient_en,
+                                qty,
+                                uom=uom_val,
+                                is_ingredient=True,
+                                mode="add",
+                                move_type="receipt_restock",
+                                note=f"영수증 입고: {name}",
+                            )
+                            updated += 1
+                            final_items.append({
+                                "name": name,
+                                "ingredient_en": ingredient_en,
+                                "qty": qty,
+                                "uom": uom_val,
+                                "price": price,
+                                "total": total,
+                            })
+
+                    if updated:
+                        update_receipt_metadata(receipt_id, {
+                            "inventory_saved_at": datetime.now().isoformat(),
+                            "inventory_count": updated,
+                            "inventory_items": final_items,
+                            "inventory_unmatched_items": list(set(unmatched)),
+                            "receipt_store_name": store_name,
+                            "receipt_date": str(stock_date),
+                            "receipt_time": stock_time,
+                            "inventory_total": calc_total,
+                        })
+                        st.success(f"✅ 재고 {updated}건 반영 완료!")
+                        if unmatched:
+                            st.warning(f"매칭 실패 품목: {', '.join(sorted(set(unmatched)))}")
+                        clear_cache_safe(load_inventory_df, load_all_core_data)
+                        safe_rerun()
+                    else:
+                        st.warning("반영할 재고 항목이 없습니다.")
 
         st.markdown("---")
         st.subheader("📄 엑셀 업로드로 재고 입고")
@@ -4637,6 +4754,15 @@ elif menu == "재고 관리":
         )
         inv_excel_meta = save_upload_file_once(inv_excel, "inventory_excel_upload", "inventory_excel")
         if inv_excel_meta:
+            signed_url = build_signed_url_from_meta(inv_excel_meta)
+            console_url = build_storage_console_url(
+                inv_excel_meta.get("storage_bucket"),
+                inv_excel_meta.get("storage_path"),
+            )
+            if signed_url:
+                st.link_button("업로드 파일 열기", signed_url, use_container_width=True)
+            elif console_url:
+                st.link_button("Storage에서 보기", console_url, use_container_width=True)
             if inv_excel_meta.get("saved_storage") and inv_excel_meta.get("storage_uri"):
                 st.caption(f"Storage 저장 경로: {inv_excel_meta.get('storage_uri')}")
             elif inv_excel_meta.get("saved_local") and inv_excel_meta.get("local_path"):
