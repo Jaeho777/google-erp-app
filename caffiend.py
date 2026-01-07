@@ -26,7 +26,7 @@ import textwrap
 from pricing_fetch import fetch_naver_prices, load_mapping, merge_price_rows
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 
 # === [AI/ML 통합 추가] ===
 # SPRINT 1 (AI 비서) 및 SPRINT 2 (수요 예측) 라이브러리
@@ -273,6 +273,7 @@ def _resolve_path(val, default: Path) -> Path:
 DATA_DIR   = _resolve_path(SECRETS.get("DATA_DIR")   or os.environ.get("ERP_DATA_DIR"),   BASE_DIR / "data")
 ASSETS_DIR = _resolve_path(SECRETS.get("ASSETS_DIR") or os.environ.get("ERP_ASSETS_DIR"), BASE_DIR / "assets")
 KEYS_DIR   = _resolve_path(SECRETS.get("KEYS_DIR")   or os.environ.get("ERP_KEYS_DIR"),   BASE_DIR / "keys")
+RECEIPT_DIR = _resolve_path(SECRETS.get("RECEIPT_DIR") or os.environ.get("ERP_RECEIPT_DIR"), DATA_DIR / "receipts")
 
 CSV_PATH     = DATA_DIR / "데이터 증강.csv"
 CSV_AUGMENTED_PATH = DATA_DIR / "데이터 증강.csv"
@@ -286,6 +287,7 @@ SALES_COLLECTION      = "coffee_sales"
 INVENTORY_COLLECTION  = "inventory"
 ORDERS_COLLECTION     = "orders"
 SKU_PARAMS_COLLECTION = "sku_params"
+RECEIPT_COLLECTION    = "receipt_uploads"
 
 RECIPES_COLLECTION      = "recipes"
 STOCK_COUNTS_COLLECTION = "stock_counts"
@@ -316,7 +318,7 @@ SEED_MENUS = [
 ]
 
 
-for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR):
+for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR, RECEIPT_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 def safe_doc_id(name: str) -> str:
@@ -361,6 +363,118 @@ def init_firestore():
 
 
 db = init_firestore()
+
+def _guess_receipt_extension(uploaded_file) -> str:
+    name = getattr(uploaded_file, "name", "") or ""
+    ext = Path(name).suffix.lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        return ".jpg" if ext == ".jpeg" else ext
+    mime_type = getattr(uploaded_file, "type", "") or ""
+    if mime_type == "image/png":
+        return ".png"
+    if mime_type == "image/webp":
+        return ".webp"
+    return ".jpg"
+
+def get_storage_bucket_name() -> str | None:
+    bucket = SECRETS.get("firebase_storage_bucket") or os.environ.get("FIREBASE_STORAGE_BUCKET")
+    if bucket:
+        return str(bucket)
+    project_id = None
+    svc_dict = SECRETS.get("firebase_service_account")
+    if isinstance(svc_dict, dict):
+        project_id = svc_dict.get("project_id")
+    project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+    if project_id:
+        return f"{project_id}.appspot.com"
+    return None
+
+def update_receipt_metadata(receipt_id: str | None, payload: dict) -> None:
+    if not receipt_id or not payload:
+        return
+    try:
+        db.collection(RECEIPT_COLLECTION).document(receipt_id).set(payload, merge=True)
+    except Exception as e:
+        st.warning(f"영수증 메타데이터 저장 실패: {e}")
+
+def save_receipt_image(uploaded_file, receipt_kind: str, receipt_id: str | None = None) -> dict | None:
+    if uploaded_file is None:
+        return None
+    receipt_id = receipt_id or uuid.uuid4().hex
+    now = datetime.now()
+    date_folder = now.strftime("%Y/%m/%d")
+    ext = _guess_receipt_extension(uploaded_file)
+    file_name = f"{receipt_kind}_{now.strftime('%Y%m%d_%H%M%S')}_{receipt_id}{ext}"
+    bytes_data = uploaded_file.getvalue()
+    mime_type = getattr(uploaded_file, "type", None) or "image/jpeg"
+
+    local_path = None
+    saved_local = False
+    try:
+        local_dir = RECEIPT_DIR / receipt_kind / date_folder
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / file_name
+        local_path.write_bytes(bytes_data)
+        saved_local = True
+    except Exception as e:
+        st.warning(f"영수증 이미지 로컬 저장 실패: {e}")
+
+    storage_path = f"receipts/{receipt_kind}/{date_folder}/{file_name}"
+    storage_bucket = None
+    storage_uri = None
+    saved_storage = False
+    try:
+        bucket_name = get_storage_bucket_name()
+        bucket = storage.bucket(bucket_name) if bucket_name else storage.bucket()
+        storage_bucket = bucket.name
+        blob = bucket.blob(storage_path)
+        blob.metadata = {"receipt_id": receipt_id, "receipt_kind": receipt_kind}
+        blob.upload_from_string(bytes_data, content_type=mime_type)
+        storage_uri = f"gs://{bucket.name}/{storage_path}"
+        saved_storage = True
+    except Exception as e:
+        st.warning(f"영수증 이미지 Storage 업로드 실패: {e}")
+
+    if not saved_local and not saved_storage:
+        return None
+
+    meta = {
+        "receipt_id": receipt_id,
+        "kind": receipt_kind,
+        "created_at": now.isoformat(),
+        "file_name": file_name,
+        "original_filename": getattr(uploaded_file, "name", None),
+        "content_type": mime_type,
+        "size_bytes": len(bytes_data),
+        "storage_path": storage_path if saved_storage else None,
+        "storage_bucket": storage_bucket,
+        "storage_uri": storage_uri,
+        "local_path": str(local_path) if saved_local and local_path else None,
+        "saved_local": saved_local,
+        "saved_storage": saved_storage,
+        "source": "streamlit",
+    }
+    update_receipt_metadata(receipt_id, meta)
+    return meta
+
+def normalize_receipt_date(raw: str | None, default):
+    if not raw:
+        return default
+    parsed = pd.to_datetime(str(raw).strip(), errors="coerce")
+    if pd.isna(parsed):
+        return default
+    return parsed.date()
+
+def normalize_receipt_time(raw: str | None, default: str) -> str:
+    if not raw:
+        return default
+    s = str(raw).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%H:%M:%S")
+        except Exception:
+            continue
+    return default
 
 # === [AI/ML 통합 추가] ===
 # SPRINT 1: Gemini API 키 설정
@@ -564,6 +678,29 @@ def build_menu_candidates(name: str) -> set[str]:
     # 한글 변환 후보 추가
     variants |= {to_korean_detail(v) for v in list(variants)}
     return variants
+
+def build_menu_lookup(menu_names: list[str]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for name in menu_names:
+        for cand in build_menu_candidates(name):
+            lookup.setdefault(cand, name)
+        compact = re.sub(r"\s+", "", str(name)).lower()
+        if compact:
+            lookup.setdefault(compact, name)
+    return lookup
+
+def match_menu_name(raw_name: str, menu_lookup: dict[str, str]) -> tuple[str, bool]:
+    raw = str(raw_name or "").strip()
+    if not raw:
+        return "", False
+    candidates = build_menu_candidates(raw)
+    mapped = apply_name_map(raw)
+    candidates |= build_menu_candidates(mapped)
+    candidates.add(re.sub(r"\s+", "", raw).lower())
+    for cand in candidates:
+        if cand in menu_lookup:
+            return menu_lookup[cand], True
+    return raw, False
 
 from typing import Union
 
@@ -2199,6 +2336,202 @@ if menu == "거래 추가":
         st.session_state.prefill_from_history = False
     st.session_state.setdefault("order_channel", "직접입력")
 
+    st.subheader("📸 매출 영수증 기반 거래 입력")
+    st.caption("매출 영수증을 업로드하면 AI가 자동으로 거래 내역을 입력해줍니다.")
+
+    if "sales_receipt_result" not in st.session_state:
+        st.session_state.sales_receipt_result = None
+    if "sales_receipt_meta" not in st.session_state:
+        st.session_state.sales_receipt_meta = None
+
+    if st.session_state.sales_receipt_result is None:
+        st.markdown("### 영수증 사진 업로드")
+        with st.container(border=True):
+            sales_uploaded = st.file_uploader(
+                "드래그 앤 드롭 또는 클릭하여 파일 선택",
+                type=["png", "jpg", "jpeg", "webp"],
+                help="AI가 영수증 정보를 자동으로 추출해 드립니다.",
+                key="sales_receipt_uploader",
+            )
+            if sales_uploaded is not None:
+                st.image(sales_uploaded, caption="업로드된 영수증", width=300)
+                if st.button("🤖 AI 분석 시작", type="primary", use_container_width=True, key="sales_receipt_analyze"):
+                    with st.spinner("AI가 영수증을 읽고 있습니다... (약 5~10초 소요) 🧠"):
+                        receipt_meta = save_receipt_image(sales_uploaded, "sales")
+                        if not receipt_meta:
+                            st.error("영수증 저장에 실패했습니다. 다시 시도해주세요.")
+                        else:
+                            st.session_state.sales_receipt_meta = receipt_meta
+                            data = analyze_receipt_image(sales_uploaded)
+                            if data:
+                                st.session_state.sales_receipt_result = data
+                                st.session_state.sales_receipt_image = sales_uploaded
+                                update_receipt_metadata(receipt_meta.get("receipt_id"), {"analysis_result": data})
+                                safe_rerun()
+    else:
+        st.markdown("### 📝 데이터 검토 및 수정")
+
+        data = st.session_state.sales_receipt_result
+
+        col_img, col_info = st.columns([1, 2])
+        with col_img:
+            st.image(st.session_state.sales_receipt_image, caption="원본 이미지", use_container_width=True)
+            if st.button("🔄 다른 영수증 올리기", key="sales_receipt_reset"):
+                st.session_state.sales_receipt_result = None
+                st.session_state.sales_receipt_image = None
+                st.session_state.sales_receipt_meta = None
+                safe_rerun()
+
+        with col_info:
+            st.markdown("#### 영수증 정보")
+            with st.container(border=True):
+                c1, c2, c3 = st.columns(3)
+                store_name = c1.text_input("상호명", value=data.get("store_name", ""), key="sales_receipt_store")
+                date_val = c2.text_input("거래 날짜", value=data.get("date", ""), key="sales_receipt_date")
+                time_val = c3.text_input("거래 시간", value=data.get("time", ""), key="sales_receipt_time")
+
+        st.markdown("#### 📦 물품 목록")
+
+        items_df = pd.DataFrame(data.get("items", []))
+        if items_df.empty:
+            items_df = pd.DataFrame(columns=["name", "qty", "price", "total"])
+
+        edited_items = st.data_editor(
+            items_df,
+            column_config={
+                "name": st.column_config.TextColumn("물품명"),
+                "qty": st.column_config.NumberColumn("수량", min_value=1),
+                "price": st.column_config.NumberColumn("단가", format="%d원"),
+                "total": st.column_config.NumberColumn("총액", format="%d원"),
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="sales_receipt_editor",
+        )
+
+        st.markdown("---")
+        try:
+            calc_total = edited_items["total"].sum()
+        except Exception:
+            calc_total = 0
+        ai_total = safe_float(data.get("total_amount", 0), 0)
+
+        col_sum1, col_sum2 = st.columns([3, 1])
+        with col_sum2:
+            st.metric("계산된 총액", f"{calc_total:,.0f}원", delta=f"AI 인식 금액: {ai_total:,.0f}원")
+
+        st.markdown("---")
+        if st.button("💾 매출 데이터로 저장", type="primary", use_container_width=True, key="sales_receipt_save"):
+            receipt_meta = st.session_state.sales_receipt_meta or {}
+            receipt_id = receipt_meta.get("receipt_id")
+            if not receipt_id and st.session_state.get("sales_receipt_image") is not None:
+                receipt_meta = save_receipt_image(st.session_state.sales_receipt_image, "sales")
+                receipt_id = receipt_meta.get("receipt_id") if receipt_meta else None
+
+            sale_date = normalize_receipt_date(date_val, today)
+            sale_time = normalize_receipt_time(time_val, datetime.now().strftime("%H:%M:%S"))
+
+            menu_options = get_menu_options(df, df_inv)
+            menu_lookup = build_menu_lookup(menu_options)
+            unmatched = []
+            saved_ids = []
+            final_items = []
+
+            with st.spinner("매출 데이터를 저장 중..."):
+                for _, row in edited_items.iterrows():
+                    name = str(row.get("name", "")).strip()
+                    if not name:
+                        continue
+                    qty = int(safe_float(row.get("qty", 1), 1))
+                    if qty <= 0:
+                        continue
+                    price = safe_float(row.get("price", 0.0), 0.0)
+                    total = safe_float(row.get("total", 0.0), 0.0)
+                    if price <= 0 and total > 0 and qty > 0:
+                        price = total / qty
+                    revenue = price * qty if price > 0 else total
+
+                    menu_ko, matched = match_menu_name(name, menu_lookup)
+                    if not matched:
+                        unmatched.append(name)
+
+                    try:
+                        recent_row = df[df['상품상세'] == menu_ko].sort_values('날짜').iloc[-1]
+                        recent_cat = recent_row.get('상품카테고리', '기타')
+                        recent_type = recent_row.get('상품타입', '기타')
+                    except Exception:
+                        recent_cat = "기타"
+                        recent_type = "기타"
+
+                    menu_en = apply_name_map(from_korean_detail(menu_ko))
+                    save_doc = {
+                        "날짜": str(sale_date),
+                        "상품상세": menu_en,
+                        "상품상세_ko": menu_ko,
+                        "상품카테고리": rev_category_map.get(recent_cat, recent_cat),
+                        "상품타입": rev_type_map.get(recent_type, recent_type),
+                        "수량": qty,
+                        "단가": price,
+                        "수익": revenue,
+                        "가게위치": "Firebase",
+                        "가게ID": "LOCAL",
+                        "채널": "영수증",
+                        "시간": sale_time,
+                    }
+                    if receipt_id:
+                        save_doc["receipt_id"] = receipt_id
+                    if receipt_meta:
+                        if receipt_meta.get("storage_path"):
+                            save_doc["receipt_storage_path"] = receipt_meta.get("storage_path")
+                        if receipt_meta.get("storage_uri"):
+                            save_doc["receipt_storage_uri"] = receipt_meta.get("storage_uri")
+                    if store_name:
+                        save_doc["receipt_store_name"] = store_name
+                    if data.get("total_amount") is not None:
+                        save_doc["receipt_total_amount"] = data.get("total_amount")
+
+                    doc_ref, _ = db.collection(SALES_COLLECTION).add(save_doc)
+                    saved_ids.append(doc_ref.id)
+                    final_items.append({
+                        "name": name,
+                        "menu_name": menu_ko,
+                        "qty": qty,
+                        "price": price,
+                        "total": revenue,
+                    })
+
+                    adjust_inventory_by_recipe(
+                        menu_en,
+                        qty,
+                        move_type="sale",
+                        note=f"영수증 입력: {menu_ko} x{qty}",
+                    )
+
+            if saved_ids:
+                update_receipt_metadata(receipt_id, {
+                    "sales_doc_ids": saved_ids,
+                    "sales_count": len(saved_ids),
+                    "sales_saved_at": datetime.now().isoformat(),
+                    "receipt_store_name": store_name,
+                    "receipt_date": str(sale_date),
+                    "receipt_time": sale_time,
+                    "final_items": final_items,
+                    "final_total": calc_total,
+                    "unmatched_items": list(set(unmatched)),
+                })
+                st.success(f"✅ 매출 데이터 {len(saved_ids)}건 저장 완료! (재고 자동 차감)")
+                if unmatched:
+                    st.warning(f"메뉴 매칭 실패 항목: {', '.join(sorted(set(unmatched)))}")
+                clear_cache_safe(load_all_core_data, load_inventory_df)
+                st.session_state.sales_receipt_result = None
+                st.session_state.sales_receipt_image = None
+                st.session_state.sales_receipt_meta = None
+                safe_rerun()
+            else:
+                st.warning("저장할 거래 항목이 없습니다.")
+
+        st.markdown("---")
+
     st.markdown("#### ⚡ 간편 입력")
     # c_toss, c_dg = st.columns(2)
     # with c_toss:
@@ -3761,6 +4094,8 @@ elif menu == "재고 관리":
         # 세션 상태 초기화 (분석 결과를 저장하기 위함)
         if "receipt_result" not in st.session_state:
             st.session_state.receipt_result = None
+        if "receipt_meta" not in st.session_state:
+            st.session_state.receipt_meta = None
 
         # --- [화면 1] 업로드 UI ---
         # 분석 결과가 없으면 업로드 화면을 보여줌
@@ -3780,13 +4115,19 @@ elif menu == "재고 관리":
                     
                     if st.button("🤖 AI 분석 시작", type="primary", use_container_width=True):
                         with st.spinner("AI가 영수증을 읽고 있습니다... (약 5~10초 소요) 🧠"):
-                            # API 호출
-                            data = analyze_receipt_image(uploaded_file)
-                            
-                            if data:
-                                st.session_state.receipt_result = data
-                                st.session_state.receipt_image = uploaded_file # 이미지도 유지
-                                safe_rerun() # 화면 갱신하여 결과 화면으로 이동
+                            receipt_meta = save_receipt_image(uploaded_file, "inventory")
+                            if not receipt_meta:
+                                st.error("영수증 저장에 실패했습니다. 다시 시도해주세요.")
+                            else:
+                                st.session_state.receipt_meta = receipt_meta
+                                # API 호출
+                                data = analyze_receipt_image(uploaded_file)
+                                
+                                if data:
+                                    st.session_state.receipt_result = data
+                                    st.session_state.receipt_image = uploaded_file # 이미지도 유지
+                                    update_receipt_metadata(receipt_meta.get("receipt_id"), {"analysis_result": data})
+                                    safe_rerun() # 화면 갱신하여 결과 화면으로 이동
 
         # --- [화면 2] 분석 결과 확인 및 수정 UI ---
         else:
@@ -3802,6 +4143,7 @@ elif menu == "재고 관리":
                 if st.button("🔄 다른 영수증 올리기"):
                     st.session_state.receipt_result = None
                     st.session_state.receipt_image = None
+                    st.session_state.receipt_meta = None
                     safe_rerun()
 
             with col_info:
@@ -3845,7 +4187,7 @@ elif menu == "재고 관리":
             except:
                 calc_total = 0
                 
-            ai_total = data.get("total_amount", 0)
+            ai_total = safe_float(data.get("total_amount", 0), 0)
 
             col_sum1, col_sum2 = st.columns([3, 1])
             with col_sum2:
