@@ -4,6 +4,7 @@
 # ==============================================================
 
 import os
+import io
 import json
 import re
 import warnings
@@ -26,7 +27,7 @@ import textwrap
 from pricing_fetch import fetch_naver_prices, load_mapping, merge_price_rows
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, storage
 
 # === [AI/ML 통합 추가] ===
 # SPRINT 1 (AI 비서) 및 SPRINT 2 (수요 예측) 라이브러리
@@ -273,6 +274,8 @@ def _resolve_path(val, default: Path) -> Path:
 DATA_DIR   = _resolve_path(SECRETS.get("DATA_DIR")   or os.environ.get("ERP_DATA_DIR"),   BASE_DIR / "data")
 ASSETS_DIR = _resolve_path(SECRETS.get("ASSETS_DIR") or os.environ.get("ERP_ASSETS_DIR"), BASE_DIR / "assets")
 KEYS_DIR   = _resolve_path(SECRETS.get("KEYS_DIR")   or os.environ.get("ERP_KEYS_DIR"),   BASE_DIR / "keys")
+RECEIPT_DIR = _resolve_path(SECRETS.get("RECEIPT_DIR") or os.environ.get("ERP_RECEIPT_DIR"), DATA_DIR / "receipts")
+UPLOAD_DIR = _resolve_path(SECRETS.get("UPLOAD_DIR") or os.environ.get("ERP_UPLOAD_DIR"), DATA_DIR / "uploads")
 
 CSV_PATH     = DATA_DIR / "데이터 증강.csv"
 CSV_AUGMENTED_PATH = DATA_DIR / "데이터 증강.csv"
@@ -286,6 +289,8 @@ SALES_COLLECTION      = "coffee_sales"
 INVENTORY_COLLECTION  = "inventory"
 ORDERS_COLLECTION     = "orders"
 SKU_PARAMS_COLLECTION = "sku_params"
+RECEIPT_COLLECTION    = "receipt_uploads"
+UPLOADS_COLLECTION    = "file_uploads"
 
 RECIPES_COLLECTION      = "recipes"
 STOCK_COUNTS_COLLECTION = "stock_counts"
@@ -316,7 +321,7 @@ SEED_MENUS = [
 ]
 
 
-for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR):
+for p in (DATA_DIR, ASSETS_DIR, KEYS_DIR, RECEIPT_DIR, UPLOAD_DIR):
     p.mkdir(parents=True, exist_ok=True)
 
 def safe_doc_id(name: str) -> str:
@@ -361,6 +366,226 @@ def init_firestore():
 
 
 db = init_firestore()
+
+def _guess_receipt_extension(uploaded_file) -> str:
+    name = getattr(uploaded_file, "name", "") or ""
+    ext = Path(name).suffix.lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        return ".jpg" if ext == ".jpeg" else ext
+    mime_type = getattr(uploaded_file, "type", "") or ""
+    if mime_type == "image/png":
+        return ".png"
+    if mime_type == "image/webp":
+        return ".webp"
+    return ".jpg"
+
+def get_storage_bucket_name() -> str | None:
+    bucket = SECRETS.get("firebase_storage_bucket") or os.environ.get("FIREBASE_STORAGE_BUCKET")
+    if bucket:
+        return str(bucket)
+    project_id = None
+    svc_dict = SECRETS.get("firebase_service_account")
+    if isinstance(svc_dict, dict):
+        project_id = svc_dict.get("project_id")
+    project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+    if project_id:
+        return f"{project_id}.appspot.com"
+    return None
+
+def update_receipt_metadata(receipt_id: str | None, payload: dict) -> None:
+    if not receipt_id or not payload:
+        return
+    try:
+        db.collection(RECEIPT_COLLECTION).document(receipt_id).set(payload, merge=True)
+    except Exception as e:
+        st.warning(f"영수증 메타데이터 저장 실패: {e}")
+
+def save_receipt_image(uploaded_file, receipt_kind: str, receipt_id: str | None = None) -> dict | None:
+    if uploaded_file is None:
+        return None
+    receipt_id = receipt_id or uuid.uuid4().hex
+    now = datetime.now()
+    date_folder = now.strftime("%Y/%m/%d")
+    ext = _guess_receipt_extension(uploaded_file)
+    file_name = f"{receipt_kind}_{now.strftime('%Y%m%d_%H%M%S')}_{receipt_id}{ext}"
+    bytes_data = uploaded_file.getvalue()
+    mime_type = getattr(uploaded_file, "type", None) or "image/jpeg"
+
+    local_path = None
+    saved_local = False
+    try:
+        local_dir = RECEIPT_DIR / receipt_kind / date_folder
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / file_name
+        local_path.write_bytes(bytes_data)
+        saved_local = True
+    except Exception as e:
+        st.warning(f"영수증 이미지 로컬 저장 실패: {e}")
+
+    storage_path = f"receipts/{receipt_kind}/{date_folder}/{file_name}"
+    storage_bucket = None
+    storage_uri = None
+    saved_storage = False
+    try:
+        bucket_name = get_storage_bucket_name()
+        bucket = storage.bucket(bucket_name) if bucket_name else storage.bucket()
+        storage_bucket = bucket.name
+        blob = bucket.blob(storage_path)
+        blob.metadata = {"receipt_id": receipt_id, "receipt_kind": receipt_kind}
+        blob.upload_from_string(bytes_data, content_type=mime_type)
+        storage_uri = f"gs://{bucket.name}/{storage_path}"
+        saved_storage = True
+    except Exception as e:
+        st.warning(f"영수증 이미지 Storage 업로드 실패: {e}")
+
+    if not saved_local and not saved_storage:
+        return None
+
+    meta = {
+        "receipt_id": receipt_id,
+        "kind": receipt_kind,
+        "created_at": now.isoformat(),
+        "file_name": file_name,
+        "original_filename": getattr(uploaded_file, "name", None),
+        "content_type": mime_type,
+        "size_bytes": len(bytes_data),
+        "storage_path": storage_path if saved_storage else None,
+        "storage_bucket": storage_bucket,
+        "storage_uri": storage_uri,
+        "local_path": str(local_path) if saved_local and local_path else None,
+        "saved_local": saved_local,
+        "saved_storage": saved_storage,
+        "source": "streamlit",
+    }
+    update_receipt_metadata(receipt_id, meta)
+    return meta
+
+def _guess_upload_extension(uploaded_file) -> str:
+    name = getattr(uploaded_file, "name", "") or ""
+    ext = Path(name).suffix.lower()
+    if ext:
+        return ext
+    mime_type = getattr(uploaded_file, "type", "") or ""
+    if mime_type == "text/csv":
+        return ".csv"
+    if mime_type in {"application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}:
+        return ".xlsx"
+    return ".bin"
+
+def update_upload_metadata(upload_id: str | None, payload: dict) -> None:
+    if not upload_id or not payload:
+        return
+    try:
+        db.collection(UPLOADS_COLLECTION).document(upload_id).set(payload, merge=True)
+    except Exception as e:
+        st.warning(f"업로드 메타데이터 저장 실패: {e}")
+
+def save_data_upload_file(uploaded_file,
+                          upload_kind: str,
+                          category: str = "excel",
+                          upload_id: str | None = None,
+                          bytes_data: bytes | None = None) -> dict | None:
+    if uploaded_file is None:
+        return None
+    upload_id = upload_id or uuid.uuid4().hex
+    now = datetime.now()
+    date_folder = now.strftime("%Y/%m/%d")
+    ext = _guess_upload_extension(uploaded_file)
+    file_name = f"{upload_kind}_{now.strftime('%Y%m%d_%H%M%S')}_{upload_id}{ext}"
+    bytes_data = bytes_data or uploaded_file.getvalue()
+    mime_type = getattr(uploaded_file, "type", None) or "application/octet-stream"
+
+    local_path = None
+    saved_local = False
+    try:
+        local_dir = UPLOAD_DIR / category / upload_kind / date_folder
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / file_name
+        local_path.write_bytes(bytes_data)
+        saved_local = True
+    except Exception as e:
+        st.warning(f"업로드 파일 로컬 저장 실패: {e}")
+
+    storage_path = f"uploads/{category}/{upload_kind}/{date_folder}/{file_name}"
+    storage_bucket = None
+    storage_uri = None
+    saved_storage = False
+    try:
+        bucket_name = get_storage_bucket_name()
+        bucket = storage.bucket(bucket_name) if bucket_name else storage.bucket()
+        storage_bucket = bucket.name
+        blob = bucket.blob(storage_path)
+        blob.metadata = {"upload_id": upload_id, "upload_kind": upload_kind, "category": category}
+        blob.upload_from_string(bytes_data, content_type=mime_type)
+        storage_uri = f"gs://{bucket.name}/{storage_path}"
+        saved_storage = True
+    except Exception as e:
+        st.warning(f"업로드 파일 Storage 업로드 실패: {e}")
+
+    if not saved_local and not saved_storage:
+        return None
+
+    meta = {
+        "upload_id": upload_id,
+        "kind": upload_kind,
+        "category": category,
+        "created_at": now.isoformat(),
+        "file_name": file_name,
+        "original_filename": getattr(uploaded_file, "name", None),
+        "content_type": mime_type,
+        "size_bytes": len(bytes_data),
+        "storage_path": storage_path if saved_storage else None,
+        "storage_bucket": storage_bucket,
+        "storage_uri": storage_uri,
+        "local_path": str(local_path) if saved_local and local_path else None,
+        "saved_local": saved_local,
+        "saved_storage": saved_storage,
+        "source": "streamlit",
+    }
+    update_upload_metadata(upload_id, meta)
+    return meta
+
+def save_upload_file_once(uploaded_file,
+                          session_prefix: str,
+                          upload_kind: str,
+                          category: str = "excel") -> dict | None:
+    if uploaded_file is None:
+        st.session_state.pop(f"{session_prefix}_sig", None)
+        st.session_state.pop(f"{session_prefix}_meta", None)
+        return None
+    bytes_data = uploaded_file.getvalue()
+    signature = f"{getattr(uploaded_file, 'name', '')}:{len(bytes_data)}"
+    sig_key = f"{session_prefix}_sig"
+    meta_key = f"{session_prefix}_meta"
+    if st.session_state.get(sig_key) != signature:
+        meta = save_data_upload_file(
+            uploaded_file,
+            upload_kind=upload_kind,
+            category=category,
+            bytes_data=bytes_data,
+        )
+        st.session_state[sig_key] = signature
+        st.session_state[meta_key] = meta
+    return st.session_state.get(meta_key)
+
+def normalize_receipt_date(raw: str | None, default):
+    if not raw:
+        return default
+    parsed = pd.to_datetime(str(raw).strip(), errors="coerce")
+    if pd.isna(parsed):
+        return default
+    return parsed.date()
+
+def normalize_receipt_time(raw: str | None, default: str) -> str:
+    if not raw:
+        return default
+    s = str(raw).strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%H:%M:%S")
+        except Exception:
+            continue
+    return default
 
 # === [AI/ML 통합 추가] ===
 # SPRINT 1: Gemini API 키 설정
@@ -564,6 +789,132 @@ def build_menu_candidates(name: str) -> set[str]:
     # 한글 변환 후보 추가
     variants |= {to_korean_detail(v) for v in list(variants)}
     return variants
+
+def build_menu_lookup(menu_names: list[str]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for name in menu_names:
+        for cand in build_menu_candidates(name):
+            lookup.setdefault(cand, name)
+        compact = re.sub(r"\s+", "", str(name)).lower()
+        if compact:
+            lookup.setdefault(compact, name)
+    return lookup
+
+def match_menu_name(raw_name: str, menu_lookup: dict[str, str]) -> tuple[str, bool]:
+    raw = str(raw_name or "").strip()
+    if not raw:
+        return "", False
+    candidates = build_menu_candidates(raw)
+    mapped = apply_name_map(raw)
+    candidates |= build_menu_candidates(mapped)
+    candidates.add(re.sub(r"\s+", "", raw).lower())
+    for cand in candidates:
+        if cand in menu_lookup:
+            return menu_lookup[cand], True
+    return raw, False
+
+def normalize_column_key(value: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", str(value or "").strip().lower())
+
+def pick_column(df: pd.DataFrame, aliases: list[str]) -> str | None:
+    col_lookup = {normalize_column_key(c): c for c in df.columns}
+    for alias in aliases:
+        key = normalize_column_key(alias)
+        if key in col_lookup:
+            return col_lookup[key]
+    return None
+
+def read_tabular_upload(uploaded_file, bytes_data: bytes | None = None) -> pd.DataFrame | None:
+    if uploaded_file is None:
+        return None
+    name = str(getattr(uploaded_file, "name", "")).lower()
+    try:
+        if bytes_data is None:
+            bytes_data = uploaded_file.getvalue()
+        buf = io.BytesIO(bytes_data)
+        if name.endswith(".csv"):
+            return pd.read_csv(buf)
+        return pd.read_excel(buf)
+    except Exception as e:
+        st.error(f"엑셀/CSV 파일을 읽는 중 오류가 발생했습니다: {e}")
+        return None
+
+def normalize_cell_str(value, default: str = "") -> str:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    s = str(value).strip()
+    return s if s else default
+
+def parse_truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    s = str(value or "").strip().lower()
+    if s in {"y", "yes", "true", "1", "t", "o"}:
+        return True
+    if s in {"n", "no", "false", "0", "f", "x"}:
+        return False
+    return False
+
+def build_inventory_lookup(df_inv: pd.DataFrame) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    if df_inv is None or df_inv.empty:
+        return lookup
+    for _, row in df_inv.iterrows():
+        ko = str(row.get("상품상세", "")).strip()
+        en = str(row.get("상품상세_en", "")).strip()
+        keys = {
+            ko,
+            en,
+            ko.lower(),
+            en.lower(),
+            re.sub(r"\s+", "", ko).lower(),
+            re.sub(r"\s+", "", en).lower(),
+        }
+        for key in keys:
+            if key:
+                lookup.setdefault(key, en or ko)
+    return lookup
+
+def match_inventory_name(raw_name: str, inv_lookup: dict[str, str]) -> tuple[str, bool]:
+    raw = str(raw_name or "").strip()
+    if not raw:
+        return "", False
+    keys = {
+        raw,
+        raw.lower(),
+        re.sub(r"\s+", "", raw).lower(),
+    }
+    for key in keys:
+        if key in inv_lookup:
+            return inv_lookup[key], True
+    return from_korean_detail(raw), False
+
+SALES_UPLOAD_ALIASES = {
+    "name": ["상품상세", "상품명", "메뉴", "품목", "item", "name", "menu", "product"],
+    "qty": ["수량", "qty", "quantity", "count"],
+    "price": ["단가", "price", "unitprice", "unit_price", "가격"],
+    "total": ["총액", "total", "amount", "금액", "매출"],
+    "date": ["날짜", "date", "거래일", "거래날짜"],
+    "time": ["시간", "time", "거래시간"],
+    "category": ["상품카테고리", "카테고리", "category"],
+    "type": ["상품타입", "타입", "type"],
+    "channel": ["채널", "channel", "구분"],
+}
+
+INVENTORY_UPLOAD_ALIASES = {
+    "name": ["상품상세", "품목", "재료", "item", "name", "material"],
+    "sku": ["상품상세_en", "sku", "sku_en"],
+    "qty": ["수량", "qty", "quantity", "입고수량", "재고"],
+    "uom": ["단위", "uom", "unit"],
+    "cost_unit_size": ["매입단위", "단위수량", "cost_unit_size", "unit_size"],
+    "cost_per_unit": ["매입가", "cost_per_unit", "매입가격", "price", "cost"],
+    "is_ingredient": ["재료여부", "is_ingredient", "ingredient"],
+}
 
 from typing import Union
 
@@ -1417,6 +1768,74 @@ def adjust_inventory_by_recipe(menu_sku_en: str,
     }
     db.collection(STOCK_MOVES_COLLECTION).add(log_doc)
 
+def update_inventory_qty(ingredient_en: str,
+                         qty: float,
+                         uom: str = "ea",
+                         is_ingredient: bool = True,
+                         mode: str = "add",
+                         cost_unit_size: float | None = None,
+                         cost_per_unit: float | None = None,
+                         move_type: str = "restock",
+                         note: str = "") -> tuple[float, float, str] | None:
+    if qty == 0:
+        return None
+    ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(ingredient_en))
+    snap = ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        cur = safe_float(data.get("현재재고", 0.0), 0.0)
+        inv_uom = normalize_uom(data.get("uom", uom))
+    else:
+        cur = 0.0
+        inv_uom = normalize_uom(uom)
+        ref.set({
+            "상품상세_en": ingredient_en,
+            "상품상세": to_korean_detail(ingredient_en),
+            "초기재고": 0.0,
+            "현재재고": 0.0,
+            "uom": inv_uom,
+            "is_ingredient": bool(is_ingredient),
+            "cost_unit_size": 1.0,
+            "cost_per_unit": 0.0,
+            "unit_cost": 0.0,
+            "supply_mode": DEFAULT_SUPPLY_MODE,
+            "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
+        })
+
+    qty_converted = convert_qty(qty, from_uom=normalize_uom(uom), to_uom=inv_uom)
+    if mode == "set":
+        new_stock = max(qty_converted, 0.0)
+    else:
+        new_stock = max(cur + qty_converted, 0.0)
+
+    patch = {
+        "현재재고": new_stock,
+        "uom": inv_uom,
+        "is_ingredient": bool(is_ingredient),
+    }
+    if not snap.exists:
+        patch["초기재고"] = new_stock
+    if cost_unit_size is not None and cost_unit_size > 0:
+        patch["cost_unit_size"] = cost_unit_size
+    if cost_per_unit is not None and cost_per_unit >= 0:
+        patch["cost_per_unit"] = cost_per_unit
+    if patch:
+        ref.set(patch, merge=True)
+
+    log_doc = {
+        "ts": datetime.now().isoformat(),
+        "type": move_type,
+        "ingredient_en": ingredient_en,
+        "qty": qty_converted,
+        "uom": inv_uom,
+        "mode": mode,
+        "note": note,
+        "before": cur,
+        "after": new_stock,
+    }
+    db.collection(STOCK_MOVES_COLLECTION).add(log_doc)
+    return cur, new_stock, inv_uom
+
 # === [AI/ML 통합 추가] ===
 # SPRINT 1: Gemini API 호출 헬퍼
 def call_gemini_api(user_prompt: str, data_context: str, model: str = GEMINI_TEXT_MODEL):
@@ -2198,6 +2617,337 @@ if menu == "거래 추가":
         st.session_state.prefill_order = None
         st.session_state.prefill_from_history = False
     st.session_state.setdefault("order_channel", "직접입력")
+
+    st.subheader("📸 매출 영수증 기반 거래 입력")
+    st.caption("매출 영수증을 업로드하면 AI가 자동으로 거래 내역을 입력해줍니다.")
+
+    if "sales_receipt_result" not in st.session_state:
+        st.session_state.sales_receipt_result = None
+    if "sales_receipt_meta" not in st.session_state:
+        st.session_state.sales_receipt_meta = None
+
+    if st.session_state.sales_receipt_result is None:
+        st.markdown("### 영수증 사진 업로드")
+        with st.container(border=True):
+            sales_uploaded = st.file_uploader(
+                "드래그 앤 드롭 또는 클릭하여 파일 선택",
+                type=["png", "jpg", "jpeg", "webp"],
+                help="AI가 영수증 정보를 자동으로 추출해 드립니다.",
+                key="sales_receipt_uploader",
+            )
+            if sales_uploaded is not None:
+                st.image(sales_uploaded, caption="업로드된 영수증", width=300)
+                if st.button("🤖 AI 분석 시작", type="primary", use_container_width=True, key="sales_receipt_analyze"):
+                    with st.spinner("AI가 영수증을 읽고 있습니다... (약 5~10초 소요) 🧠"):
+                        receipt_meta = save_receipt_image(sales_uploaded, "sales")
+                        if not receipt_meta:
+                            st.error("영수증 저장에 실패했습니다. 다시 시도해주세요.")
+                        else:
+                            st.session_state.sales_receipt_meta = receipt_meta
+                            data = analyze_receipt_image(sales_uploaded)
+                            if data:
+                                st.session_state.sales_receipt_result = data
+                                st.session_state.sales_receipt_image = sales_uploaded
+                                update_receipt_metadata(receipt_meta.get("receipt_id"), {"analysis_result": data})
+                                safe_rerun()
+    else:
+        st.markdown("### 📝 데이터 검토 및 수정")
+
+        data = st.session_state.sales_receipt_result
+
+        col_img, col_info = st.columns([1, 2])
+        with col_img:
+            st.image(st.session_state.sales_receipt_image, caption="원본 이미지", use_container_width=True)
+            if st.button("🔄 다른 영수증 올리기", key="sales_receipt_reset"):
+                st.session_state.sales_receipt_result = None
+                st.session_state.sales_receipt_image = None
+                st.session_state.sales_receipt_meta = None
+                safe_rerun()
+
+        with col_info:
+            st.markdown("#### 영수증 정보")
+            with st.container(border=True):
+                c1, c2, c3 = st.columns(3)
+                store_name = c1.text_input("상호명", value=data.get("store_name", ""), key="sales_receipt_store")
+                date_val = c2.text_input("거래 날짜", value=data.get("date", ""), key="sales_receipt_date")
+                time_val = c3.text_input("거래 시간", value=data.get("time", ""), key="sales_receipt_time")
+
+        st.markdown("#### 📦 물품 목록")
+
+        items_df = pd.DataFrame(data.get("items", []))
+        if items_df.empty:
+            items_df = pd.DataFrame(columns=["name", "qty", "price", "total"])
+
+        edited_items = st.data_editor(
+            items_df,
+            column_config={
+                "name": st.column_config.TextColumn("물품명"),
+                "qty": st.column_config.NumberColumn("수량", min_value=1),
+                "price": st.column_config.NumberColumn("단가", format="%d원"),
+                "total": st.column_config.NumberColumn("총액", format="%d원"),
+            },
+            num_rows="dynamic",
+            use_container_width=True,
+            key="sales_receipt_editor",
+        )
+
+        st.markdown("---")
+        try:
+            calc_total = edited_items["total"].sum()
+        except Exception:
+            calc_total = 0
+        ai_total = safe_float(data.get("total_amount", 0), 0)
+
+        col_sum1, col_sum2 = st.columns([3, 1])
+        with col_sum2:
+            st.metric("계산된 총액", f"{calc_total:,.0f}원", delta=f"AI 인식 금액: {ai_total:,.0f}원")
+
+        st.markdown("---")
+        if st.button("💾 매출 데이터로 저장", type="primary", use_container_width=True, key="sales_receipt_save"):
+            receipt_meta = st.session_state.sales_receipt_meta or {}
+            receipt_id = receipt_meta.get("receipt_id")
+            if not receipt_id and st.session_state.get("sales_receipt_image") is not None:
+                receipt_meta = save_receipt_image(st.session_state.sales_receipt_image, "sales")
+                receipt_id = receipt_meta.get("receipt_id") if receipt_meta else None
+
+            sale_date = normalize_receipt_date(date_val, today)
+            sale_time = normalize_receipt_time(time_val, datetime.now().strftime("%H:%M:%S"))
+
+            menu_options = get_menu_options(df, df_inv)
+            menu_lookup = build_menu_lookup(menu_options)
+            unmatched = []
+            saved_ids = []
+            final_items = []
+
+            with st.spinner("매출 데이터를 저장 중..."):
+                for _, row in edited_items.iterrows():
+                    name = str(row.get("name", "")).strip()
+                    if not name:
+                        continue
+                    qty = int(safe_float(row.get("qty", 1), 1))
+                    if qty <= 0:
+                        continue
+                    price = safe_float(row.get("price", 0.0), 0.0)
+                    total = safe_float(row.get("total", 0.0), 0.0)
+                    if price <= 0 and total > 0 and qty > 0:
+                        price = total / qty
+                    revenue = price * qty if price > 0 else total
+
+                    menu_ko, matched = match_menu_name(name, menu_lookup)
+                    if not matched:
+                        unmatched.append(name)
+
+                    try:
+                        recent_row = df[df['상품상세'] == menu_ko].sort_values('날짜').iloc[-1]
+                        recent_cat = recent_row.get('상품카테고리', '기타')
+                        recent_type = recent_row.get('상품타입', '기타')
+                    except Exception:
+                        recent_cat = "기타"
+                        recent_type = "기타"
+
+                    menu_en = apply_name_map(from_korean_detail(menu_ko))
+                    save_doc = {
+                        "날짜": str(sale_date),
+                        "상품상세": menu_en,
+                        "상품상세_ko": menu_ko,
+                        "상품카테고리": rev_category_map.get(recent_cat, recent_cat),
+                        "상품타입": rev_type_map.get(recent_type, recent_type),
+                        "수량": qty,
+                        "단가": price,
+                        "수익": revenue,
+                        "가게위치": "Firebase",
+                        "가게ID": "LOCAL",
+                        "채널": "영수증",
+                        "시간": sale_time,
+                    }
+                    if receipt_id:
+                        save_doc["receipt_id"] = receipt_id
+                    if receipt_meta:
+                        if receipt_meta.get("storage_path"):
+                            save_doc["receipt_storage_path"] = receipt_meta.get("storage_path")
+                        if receipt_meta.get("storage_uri"):
+                            save_doc["receipt_storage_uri"] = receipt_meta.get("storage_uri")
+                    if store_name:
+                        save_doc["receipt_store_name"] = store_name
+                    if data.get("total_amount") is not None:
+                        save_doc["receipt_total_amount"] = data.get("total_amount")
+
+                    doc_ref, _ = db.collection(SALES_COLLECTION).add(save_doc)
+                    saved_ids.append(doc_ref.id)
+                    final_items.append({
+                        "name": name,
+                        "menu_name": menu_ko,
+                        "qty": qty,
+                        "price": price,
+                        "total": revenue,
+                    })
+
+                    adjust_inventory_by_recipe(
+                        menu_en,
+                        qty,
+                        move_type="sale",
+                        note=f"영수증 입력: {menu_ko} x{qty}",
+                    )
+
+            if saved_ids:
+                update_receipt_metadata(receipt_id, {
+                    "sales_doc_ids": saved_ids,
+                    "sales_count": len(saved_ids),
+                    "sales_saved_at": datetime.now().isoformat(),
+                    "receipt_store_name": store_name,
+                    "receipt_date": str(sale_date),
+                    "receipt_time": sale_time,
+                    "final_items": final_items,
+                    "final_total": calc_total,
+                    "unmatched_items": list(set(unmatched)),
+                })
+                st.success(f"✅ 매출 데이터 {len(saved_ids)}건 저장 완료! (재고 자동 차감)")
+                if unmatched:
+                    st.warning(f"메뉴 매칭 실패 항목: {', '.join(sorted(set(unmatched)))}")
+                clear_cache_safe(load_all_core_data, load_inventory_df)
+                st.session_state.sales_receipt_result = None
+                st.session_state.sales_receipt_image = None
+                st.session_state.sales_receipt_meta = None
+                safe_rerun()
+            else:
+                st.warning("저장할 거래 항목이 없습니다.")
+
+        st.markdown("---")
+
+    st.subheader("📄 엑셀 업로드로 매출 입력")
+    st.caption("지원 컬럼 예시: 상품상세, 수량, 단가/총액, 날짜, 시간 (csv/xlsx 가능)")
+    with st.container(border=True):
+        sales_excel = st.file_uploader(
+            "엑셀/CSV 파일 업로드",
+            type=["xlsx", "xls", "csv"],
+            key="sales_excel_uploader",
+        )
+        sales_excel_meta = save_upload_file_once(sales_excel, "sales_excel_upload", "sales_excel")
+        if sales_excel_meta:
+            if sales_excel_meta.get("saved_storage") and sales_excel_meta.get("storage_uri"):
+                st.caption(f"Storage 저장 경로: {sales_excel_meta.get('storage_uri')}")
+            elif sales_excel_meta.get("saved_local") and sales_excel_meta.get("local_path"):
+                st.caption(f"로컬 저장 경로: {sales_excel_meta.get('local_path')}")
+        df_sales_upload = read_tabular_upload(sales_excel)
+        if df_sales_upload is not None:
+            st.dataframe(df_sales_upload.head(20), use_container_width=True)
+            col_name = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["name"])
+            col_qty = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["qty"])
+            col_price = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["price"])
+            col_total = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["total"])
+            col_date = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["date"])
+            col_time = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["time"])
+            col_cat = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["category"])
+            col_type = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["type"])
+            col_channel = pick_column(df_sales_upload, SALES_UPLOAD_ALIASES["channel"])
+
+            missing_cols = []
+            if not col_name:
+                missing_cols.append("상품상세/상품명")
+            if not col_qty:
+                missing_cols.append("수량")
+            if not col_price and not col_total:
+                missing_cols.append("단가 또는 총액")
+            if missing_cols:
+                st.warning(f"필수 컬럼이 부족합니다: {', '.join(missing_cols)}")
+            else:
+                if st.button("💾 엑셀 매출 저장", type="primary", use_container_width=True, key="sales_excel_save"):
+                    default_time = datetime.now().strftime("%H:%M:%S")
+                    menu_options = get_menu_options(df, df_inv)
+                    menu_lookup = build_menu_lookup(menu_options)
+                    unmatched = []
+                    saved_ids = []
+
+                    upload_id = sales_excel_meta.get("upload_id") if sales_excel_meta else None
+                    with st.spinner("엑셀 매출 데이터를 저장 중..."):
+                        for _, row in df_sales_upload.iterrows():
+                            name = str(row.get(col_name, "")).strip()
+                            if not name:
+                                continue
+                            qty = int(safe_float(row.get(col_qty, 1), 1))
+                            if qty <= 0:
+                                continue
+                            price = safe_float(row.get(col_price, 0.0), 0.0) if col_price else 0.0
+                            total = safe_float(row.get(col_total, 0.0), 0.0) if col_total else 0.0
+                            if price <= 0 and total > 0 and qty > 0:
+                                price = total / qty
+                            revenue = price * qty if price > 0 else total
+
+                            date_raw = row.get(col_date) if col_date else None
+                            time_raw = row.get(col_time) if col_time else None
+                            sale_date = normalize_receipt_date(date_raw, today)
+                            sale_time = normalize_receipt_time(time_raw, default_time)
+
+                            menu_ko, matched = match_menu_name(name, menu_lookup)
+                            if not matched:
+                                unmatched.append(name)
+
+                            if col_cat:
+                                recent_cat = normalize_cell_str(row.get(col_cat), "기타")
+                            else:
+                                try:
+                                    recent_row = df[df['상품상세'] == menu_ko].sort_values('날짜').iloc[-1]
+                                    recent_cat = recent_row.get('상품카테고리', '기타')
+                                except Exception:
+                                    recent_cat = "기타"
+
+                            if col_type:
+                                recent_type = normalize_cell_str(row.get(col_type), "기타")
+                            else:
+                                try:
+                                    recent_row = df[df['상품상세'] == menu_ko].sort_values('날짜').iloc[-1]
+                                    recent_type = recent_row.get('상품타입', '기타')
+                                except Exception:
+                                    recent_type = "기타"
+
+                            channel_val = normalize_cell_str(row.get(col_channel), "엑셀") if col_channel else "엑셀"
+                            menu_en = apply_name_map(from_korean_detail(menu_ko))
+                            save_doc = {
+                                "날짜": str(sale_date),
+                                "상품상세": menu_en,
+                                "상품상세_ko": menu_ko,
+                                "상품카테고리": rev_category_map.get(recent_cat, recent_cat),
+                                "상품타입": rev_type_map.get(recent_type, recent_type),
+                                "수량": qty,
+                                "단가": price,
+                                "수익": revenue,
+                                "가게위치": "Firebase",
+                                "가게ID": "LOCAL",
+                                "채널": channel_val or "엑셀",
+                                "시간": sale_time,
+                            }
+                            if upload_id:
+                                save_doc["upload_id"] = upload_id
+                                if sales_excel_meta.get("storage_path"):
+                                    save_doc["upload_storage_path"] = sales_excel_meta.get("storage_path")
+                                if sales_excel_meta.get("storage_uri"):
+                                    save_doc["upload_storage_uri"] = sales_excel_meta.get("storage_uri")
+                            doc_ref, _ = db.collection(SALES_COLLECTION).add(save_doc)
+                            saved_ids.append(doc_ref.id)
+
+                            adjust_inventory_by_recipe(
+                                menu_en,
+                                qty,
+                                move_type="sale",
+                                note=f"엑셀 입력: {menu_ko} x{qty}",
+                            )
+
+                    if saved_ids:
+                        st.success(f"✅ 엑셀 매출 데이터 {len(saved_ids)}건 저장 완료! (재고 자동 차감)")
+                        if unmatched:
+                            st.warning(f"메뉴 매칭 실패 항목: {', '.join(sorted(set(unmatched)))}")
+                        if upload_id:
+                            update_upload_metadata(upload_id, {
+                                "sales_doc_ids": saved_ids,
+                                "sales_count": len(saved_ids),
+                                "linked_at": datetime.now().isoformat(),
+                            })
+                        clear_cache_safe(load_all_core_data, load_inventory_df)
+                        safe_rerun()
+                    else:
+                        st.warning("저장할 거래 항목이 없습니다.")
+
+    st.markdown("---")
 
     st.markdown("#### ⚡ 간편 입력")
     # c_toss, c_dg = st.columns(2)
@@ -3761,6 +4511,8 @@ elif menu == "재고 관리":
         # 세션 상태 초기화 (분석 결과를 저장하기 위함)
         if "receipt_result" not in st.session_state:
             st.session_state.receipt_result = None
+        if "receipt_meta" not in st.session_state:
+            st.session_state.receipt_meta = None
 
         # --- [화면 1] 업로드 UI ---
         # 분석 결과가 없으면 업로드 화면을 보여줌
@@ -3780,13 +4532,19 @@ elif menu == "재고 관리":
                     
                     if st.button("🤖 AI 분석 시작", type="primary", use_container_width=True):
                         with st.spinner("AI가 영수증을 읽고 있습니다... (약 5~10초 소요) 🧠"):
-                            # API 호출
-                            data = analyze_receipt_image(uploaded_file)
-                            
-                            if data:
-                                st.session_state.receipt_result = data
-                                st.session_state.receipt_image = uploaded_file # 이미지도 유지
-                                safe_rerun() # 화면 갱신하여 결과 화면으로 이동
+                            receipt_meta = save_receipt_image(uploaded_file, "inventory")
+                            if not receipt_meta:
+                                st.error("영수증 저장에 실패했습니다. 다시 시도해주세요.")
+                            else:
+                                st.session_state.receipt_meta = receipt_meta
+                                # API 호출
+                                data = analyze_receipt_image(uploaded_file)
+                                
+                                if data:
+                                    st.session_state.receipt_result = data
+                                    st.session_state.receipt_image = uploaded_file # 이미지도 유지
+                                    update_receipt_metadata(receipt_meta.get("receipt_id"), {"analysis_result": data})
+                                    safe_rerun() # 화면 갱신하여 결과 화면으로 이동
 
         # --- [화면 2] 분석 결과 확인 및 수정 UI ---
         else:
@@ -3802,6 +4560,7 @@ elif menu == "재고 관리":
                 if st.button("🔄 다른 영수증 올리기"):
                     st.session_state.receipt_result = None
                     st.session_state.receipt_image = None
+                    st.session_state.receipt_meta = None
                     safe_rerun()
 
             with col_info:
@@ -3845,7 +4604,7 @@ elif menu == "재고 관리":
             except:
                 calc_total = 0
                 
-            ai_total = data.get("total_amount", 0)
+            ai_total = safe_float(data.get("total_amount", 0), 0)
 
             col_sum1, col_sum2 = st.columns([3, 1])
             with col_sum2:
@@ -3859,7 +4618,124 @@ elif menu == "재고 관리":
                 if st.button("💾 DB에 저장 (재고 반영)", type="primary", use_container_width=True):
                     st.toast("✅ (시뮬레이션) 데이터가 확인되었습니다! (현재 DB 저장 기능은 비활성화 상태입니다)")
                     # 여기에 나중에 firebase 저장 코드를 넣으면 됩니다.
-    
+
+        st.markdown("---")
+        st.subheader("📄 엑셀 업로드로 재고 입고")
+        st.caption("지원 컬럼 예시: 상품상세, 수량, 단위(uom), 매입가 (csv/xlsx 가능)")
+        mode_label = st.radio(
+            "업로드 적용 방식",
+            ["입고 수량 추가", "현재 재고로 덮어쓰기"],
+            horizontal=True,
+            key="inv_excel_mode",
+        )
+        mode_value = "add" if mode_label == "입고 수량 추가" else "set"
+
+        inv_excel = st.file_uploader(
+            "엑셀/CSV 파일 업로드",
+            type=["xlsx", "xls", "csv"],
+            key="inventory_excel_uploader",
+        )
+        inv_excel_meta = save_upload_file_once(inv_excel, "inventory_excel_upload", "inventory_excel")
+        if inv_excel_meta:
+            if inv_excel_meta.get("saved_storage") and inv_excel_meta.get("storage_uri"):
+                st.caption(f"Storage 저장 경로: {inv_excel_meta.get('storage_uri')}")
+            elif inv_excel_meta.get("saved_local") and inv_excel_meta.get("local_path"):
+                st.caption(f"로컬 저장 경로: {inv_excel_meta.get('local_path')}")
+        df_inv_upload = read_tabular_upload(inv_excel)
+        if df_inv_upload is not None:
+            st.dataframe(df_inv_upload.head(20), use_container_width=True)
+            col_name = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["name"])
+            col_sku = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["sku"])
+            col_qty = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["qty"])
+            col_uom = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["uom"])
+            col_cost_unit_size = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["cost_unit_size"])
+            col_cost_per_unit = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["cost_per_unit"])
+            col_is_ingredient = pick_column(df_inv_upload, INVENTORY_UPLOAD_ALIASES["is_ingredient"])
+
+            missing_cols = []
+            if not col_name and not col_sku:
+                missing_cols.append("상품상세 또는 상품상세_en")
+            if not col_qty:
+                missing_cols.append("수량")
+            if missing_cols:
+                st.warning(f"필수 컬럼이 부족합니다: {', '.join(missing_cols)}")
+            else:
+                if st.button("💾 엑셀 재고 반영", type="primary", use_container_width=True, key="inventory_excel_save"):
+                    inv_lookup = build_inventory_lookup(df_inv)
+                    unmatched = []
+                    updated = 0
+                    upload_id = inv_excel_meta.get("upload_id") if inv_excel_meta else None
+
+                    with st.spinner("엑셀 재고 데이터를 반영 중..."):
+                        for _, row in df_inv_upload.iterrows():
+                            raw_name = str(row.get(col_name, "")).strip() if col_name else ""
+                            raw_sku = str(row.get(col_sku, "")).strip() if col_sku else ""
+                            if raw_sku:
+                                ingredient_en = raw_sku
+                                matched = True
+                            else:
+                                ingredient_en, matched = match_inventory_name(raw_name, inv_lookup)
+
+                            if not ingredient_en:
+                                continue
+
+                            qty = safe_float(row.get(col_qty, 0.0), 0.0)
+                            if qty == 0:
+                                continue
+
+                            uom = row.get(col_uom) if col_uom else None
+                            uom_val = normalize_uom(uom) if uom else "ea"
+
+                            cost_unit_size = None
+                            if col_cost_unit_size:
+                                cost_unit_size = safe_float(row.get(col_cost_unit_size, None), 0.0)
+                                if cost_unit_size <= 0:
+                                    cost_unit_size = None
+
+                            cost_per_unit = None
+                            if col_cost_per_unit:
+                                cost_per_unit = safe_float(row.get(col_cost_per_unit, None), 0.0)
+                                if cost_per_unit < 0:
+                                    cost_per_unit = None
+
+                            is_ingredient = True
+                            if col_is_ingredient:
+                                flag_raw = row.get(col_is_ingredient)
+                                if normalize_cell_str(flag_raw, ""):
+                                    is_ingredient = parse_truthy(flag_raw)
+
+                            update_inventory_qty(
+                                ingredient_en,
+                                qty,
+                                uom=uom_val,
+                                is_ingredient=is_ingredient,
+                                mode=mode_value,
+                                cost_unit_size=cost_unit_size,
+                                cost_per_unit=cost_per_unit,
+                                move_type="excel_import",
+                                note=f"엑셀 재고 입력: {raw_name or ingredient_en}",
+                            )
+
+                            if not matched:
+                                unmatched.append(raw_name or ingredient_en)
+                            updated += 1
+
+                    if updated:
+                        st.success(f"✅ 엑셀 재고 {updated}건 반영 완료!")
+                        if unmatched:
+                            st.warning(f"신규/매칭 실패 품목: {', '.join(sorted(set(unmatched)))}")
+                        if upload_id:
+                            update_upload_metadata(upload_id, {
+                                "inventory_updates": updated,
+                                "inventory_mode": mode_value,
+                                "linked_at": datetime.now().isoformat(),
+                                "unmatched_items": list(set(unmatched)),
+                            })
+                        clear_cache_safe(load_inventory_df, load_all_core_data)
+                        safe_rerun()
+                    else:
+                        st.warning("반영할 재고 항목이 없습니다.")
+
 
 # =============================================================
 # 🤖 AI 비서 (SPRINT 1)
