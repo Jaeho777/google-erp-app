@@ -1502,7 +1502,7 @@ def load_inventory_df() -> pd.DataFrame:
     for d in inv_docs:
         doc = d.to_dict() or {}
         en = doc.get("상품상세_en", d.id)
-        ko = to_korean_detail(en)
+        ko = doc.get("상품상세") or to_korean_detail(en)
         
         # [L4] 원가 정보 로드
         cost_unit_size = safe_float(doc.get("cost_unit_size", 1.0), 1.0)
@@ -1621,6 +1621,42 @@ def ensure_inventory_doc(product_detail_en: str, uom: str = "ea", is_ingredient:
 def ensure_ingredient_sku(ingredient_en: str, uom: str = "ea"):
     return ensure_inventory_doc(ingredient_en, uom=uom, is_ingredient=True)
 
+def ensure_inventory_ingredient(ingredient_name: str, uom: str = "g") -> str:
+    name = str(ingredient_name or "").strip()
+    if not name:
+        return ""
+    ingredient_en = from_korean_detail(name)
+    ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(ingredient_en))
+    snap = ref.get()
+    if snap.exists:
+        data = snap.to_dict() or {}
+        patch = {}
+        if not data.get("상품상세") and name:
+            patch["상품상세"] = name
+        if not bool(data.get("is_ingredient", False)):
+            patch["is_ingredient"] = True
+            if normalize_uom(data.get("uom")) != normalize_uom(uom):
+                patch["uom"] = normalize_uom(uom)
+        elif not data.get("uom"):
+            patch["uom"] = normalize_uom(uom)
+        if patch:
+            ref.set(patch, merge=True)
+    else:
+        ref.set({
+            "상품상세_en": ingredient_en,
+            "상품상세": name,
+            "is_ingredient": True,
+            "uom": normalize_uom(uom),
+            "초기재고": 0.0,
+            "현재재고": 0.0,
+            "cost_unit_size": 1.0,
+            "cost_per_unit": 0.0,
+            "unit_cost": 0.0,
+            "supply_mode": DEFAULT_SUPPLY_MODE,
+            "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
+        })
+    return ingredient_en
+
 
 def ensure_seed_ingredients():
     """Top5 레시피 핵심 재료를 inventory에 기본 등록합니다."""
@@ -1700,9 +1736,9 @@ def load_all_core_data():
             data = d.to_dict()
             if not data or "ingredients" not in data:
                 continue
-            menu_en = apply_name_map(d.id)
-            # Firestore doc id에는 "/"를 넣을 수 없으므로, "(I/H)"가 "_”로 저장돼도 매핑으로 복구
-            if menu_en not in MENU_MASTER_EN:
+            menu_en = data.get("menu_sku_en") or apply_name_map(d.id)
+            menu_en = apply_name_map(menu_en)
+            if not menu_en:
                 continue
             recipes[menu_en] = data["ingredients"]
     except Exception as e:
@@ -1752,7 +1788,15 @@ def get_menu_options(df_sales: pd.DataFrame, df_inventory: pd.DataFrame) -> list
 def render_menu_management(prefix: str, title: str = "🍽️ 메뉴 구성 관리"):
     if title:
         st.subheader(title)
-    st.caption("메뉴/레시피만 넣으면 바로 돌아가도록, 메뉴를 직접 추가·삭제할 수 있습니다.")
+    st.caption("메뉴를 추가하면서 레시피를 함께 등록할 수 있습니다. (초기 재고는 0으로 생성)")
+
+    try:
+        df_ingredients = df_inv[df_inv["is_ingredient"] == True].copy()
+        ingredient_options_kr = sorted(df_ingredients["상품상세"].dropna().unique().tolist())
+        ing_kr_to_en_map = dict(zip(df_ingredients["상품상세"], df_ingredients["상품상세_en"]))
+    except Exception:
+        ingredient_options_kr = []
+        ing_kr_to_en_map = {}
 
     menu_df_edit = df_inv[df_inv["is_ingredient"] == False].copy()
     menu_cols = ["상품상세", "uom", "현재재고"]
@@ -1780,12 +1824,24 @@ def render_menu_management(prefix: str, title: str = "🍽️ 메뉴 구성 관�
             help="잔 단위는 ea, 재료형 메뉴는 g/ml",
             key=f"{prefix}_menu_uom",
         )
-        init_stock = st.number_input(
-            "초기 재고(신규 메뉴용)",
-            min_value=0,
-            value=int(DEFAULT_INITIAL_STOCK),
-            key=f"{prefix}_menu_init_stock",
-        )
+        with st.expander("레시피 입력 (선택)", expanded=False):
+            if ingredient_options_kr:
+                preview = ", ".join(ingredient_options_kr[:6])
+                suffix = " ..." if len(ingredient_options_kr) > 6 else ""
+                st.caption(f"기존 재료 예시: {preview}{suffix}")
+            recipe_rows = [{"재료": None, "수량": 0.0, "단위": "g", "손실률(%)": 0.0}]
+            edited_recipe_df = st.data_editor(
+                pd.DataFrame(recipe_rows),
+                column_config={
+                    "재료": st.column_config.TextColumn("재료 (직접 입력)", required=False),
+                    "수량": st.column_config.NumberColumn("수량", min_value=0.0, format="%.2f", required=False),
+                    "단위": st.column_config.SelectboxColumn("단위", options=["g", "ml", "ea"], required=False),
+                    "손실률(%)": st.column_config.NumberColumn("손실률(%)", min_value=0.0, max_value=100.0, format="%.1f %%", required=False),
+                },
+                num_rows="dynamic",
+                use_container_width=True,
+                key=f"{prefix}_menu_recipe_editor",
+            )
         submit_menu = st.form_submit_button("메뉴 추가/업데이트")
 
     if submit_menu:
@@ -1812,15 +1868,54 @@ def render_menu_management(prefix: str, title: str = "🍽️ 메뉴 구성 관�
             else:
                 ref.set({
                     **base_fields,
-                    "초기재고": init_stock,
-                    "현재재고": init_stock,
+                    "초기재고": 0.0,
+                    "현재재고": 0.0,
                     "cost_unit_size": 1.0,
                     "cost_per_unit": 0.0,
                     "unit_cost": 0.0,
                 })
                 st.success(f"✅ '{clean_name}' 메뉴를 추가했습니다.")
 
-            clear_cache_safe(load_all_core_data, load_inventory_df)
+            final_ingredients = []
+            recipe_errors = []
+            if edited_recipe_df is not None and not edited_recipe_df.empty:
+                for _, row in edited_recipe_df.iterrows():
+                    ing_kr = str(row.get("재료") or "").strip()
+                    qty = safe_float(row.get("수량", 0.0), 0.0)
+                    if not ing_kr or qty <= 0:
+                        continue
+                    uom_val = normalize_uom(row.get("단위") or "g")
+                    ing_en = ing_kr_to_en_map.get(ing_kr)
+                    if not ing_en:
+                        ing_en = ensure_inventory_ingredient(ing_kr, uom=uom_val)
+                        if ing_en:
+                            ing_kr_to_en_map[ing_kr] = ing_en
+                    if not ing_en:
+                        recipe_errors.append(ing_kr)
+                        continue
+                    final_ingredients.append({
+                        "ingredient_en": ing_en,
+                        "qty": qty,
+                        "uom": uom_val,
+                        "waste_pct": safe_float(row.get("손실률(%)", 0.0), 0.0),
+                    })
+
+            if final_ingredients:
+                try:
+                    db.collection(RECIPES_COLLECTION).document(safe_doc_id(menu_en)).set({
+                        "ingredients": final_ingredients,
+                        "menu_sku_en": menu_en,
+                        "menu_name_ko": clean_name,
+                    }, merge=True)
+                    st.success("✅ 레시피가 함께 저장되었습니다.")
+                except Exception as e:
+                    st.warning(f"레시피 저장 실패: {e}")
+            elif edited_recipe_df is not None and edited_recipe_df.size > 0:
+                st.info("레시피 입력이 비어 있어 레시피 저장을 건너뜁니다.")
+            if recipe_errors:
+                st.warning(f"레시피 매칭 실패 재료: {', '.join(sorted(set(recipe_errors)))}")
+
+            clear_cache_safe(load_all_core_data, load_inventory_df, load_recipe)
             safe_rerun()
 
     if not menu_df_edit.empty:
@@ -4542,9 +4637,89 @@ elif menu == "재고 관리":
         
         st.markdown("---") 
 
+        with st.expander("➕/🗑️ 품목 추가·삭제", expanded=False):
+            st.caption("재료/메뉴 품목을 직접 추가하거나 삭제할 수 있습니다.")
+            with st.form("inv_add_form"):
+                c1, c2, c3 = st.columns(3)
+                new_name = c1.text_input("품목명", placeholder="예: 원두, 우유 1L")
+                new_uom = c2.selectbox("기본 단위", ["g", "ml", "ea"], index=0)
+                new_is_ingredient = c3.checkbox("재료 여부", value=True)
+                new_stock = st.number_input("현재 재고", min_value=0.0, value=0.0, format="%.2f")
+                submit_add = st.form_submit_button("품목 추가/업데이트")
+
+            if submit_add:
+                clean_name = new_name.strip()
+                if not clean_name:
+                    st.warning("품목명을 입력해주세요.")
+                else:
+                    sku_en = from_korean_detail(clean_name)
+                    ref = db.collection(INVENTORY_COLLECTION).document(safe_doc_id(sku_en))
+                    snap = ref.get()
+                    base_fields = {
+                        "상품상세_en": sku_en,
+                        "상품상세": clean_name,
+                        "is_ingredient": bool(new_is_ingredient),
+                        "uom": normalize_uom(new_uom),
+                        "supply_mode": DEFAULT_SUPPLY_MODE,
+                        "supply_lead_days": DEFAULT_SUPPLY_LEAD_DAYS,
+                    }
+                    if snap.exists:
+                        base_fields["현재재고"] = new_stock
+                        ref.set(base_fields, merge=True)
+                        st.success(f"✅ '{clean_name}' 품목을 업데이트했습니다.")
+                    else:
+                        ref.set({
+                            **base_fields,
+                            "초기재고": new_stock,
+                            "현재재고": new_stock,
+                            "cost_unit_size": 1.0,
+                            "cost_per_unit": 0.0,
+                            "unit_cost": 0.0,
+                        })
+                        st.success(f"✅ '{clean_name}' 품목을 추가했습니다.")
+                    clear_cache_safe(load_inventory_df, load_all_core_data)
+                    safe_rerun()
+
+            if df_inv.empty:
+                st.info("삭제할 품목이 없습니다. (재고가 비어있음)")
+            else:
+                st.markdown("---")
+                st.warning("선택 품목 삭제는 레시피/거래 기록에는 영향을 주지 않습니다.")
+                option_map = {
+                    f"{row['상품상세']} [{row['상품상세_en']}]": row["상품상세_en"]
+                    for _, row in df_inv.iterrows()
+                }
+                del_targets = st.multiselect(
+                    "삭제할 품목 선택",
+                    sorted(option_map.keys()),
+                    key="inv_delete_select",
+                )
+                confirm_del = st.checkbox("선택한 품목을 삭제합니다.", value=False, key="inv_delete_confirm")
+                if st.button(
+                    "선택 품목 삭제",
+                    use_container_width=True,
+                    disabled=not del_targets or not confirm_del,
+                    key="inv_delete_btn",
+                ):
+                    removed = 0
+                    for label in del_targets:
+                        sku_en = option_map.get(label)
+                        if not sku_en:
+                            continue
+                        try:
+                            db.collection(INVENTORY_COLLECTION).document(safe_doc_id(sku_en)).delete()
+                            removed += 1
+                        except Exception as e:
+                            st.warning(f"'{label}' 삭제 실패: {e}")
+                    if removed:
+                        st.success(f"🗑️ {removed}개 품목을 삭제했습니다.")
+                        clear_cache_safe(load_inventory_df, load_all_core_data)
+                        safe_rerun()
+                    else:
+                        st.info("삭제된 품목이 없습니다.")
+
         if df_inv.empty:
-            st.warning("📦 마스터 목록이 비어있습니다. '동기화' 버튼을 눌러 시작하세요.")
-            st.stop()
+            st.info("📦 마스터 목록이 비어있습니다. 위에서 품목을 추가해주세요.")
 
         scope_label = st.radio(
             "표시 범위",
@@ -4685,15 +4860,16 @@ elif menu == "재고 관리":
         
         try:
             df_ingredients = df_inv[df_inv['is_ingredient'] == True].copy()
-            if df_ingredients.empty:
-                st.error("오류: '재료/원가 마스터' 탭에서 재료를 1개 이상 체크해야 합니다.")
-                st.stop()
-            ingredient_options_kr = sorted(df_ingredients['상품상세'].unique().tolist())
+            ingredient_options_kr = sorted(df_ingredients['상품상세'].dropna().unique().tolist())
             ing_kr_to_en_map = dict(zip(df_ingredients['상품상세'], df_ingredients['상품상세_en']))
             ing_en_to_kr_map = dict(zip(df_ingredients['상품상세_en'], df_ingredients['상품상세']))
+            if df_ingredients.empty:
+                st.info("현재 등록된 재료가 없습니다. 레시피에 재료명을 입력하면 자동으로 추가됩니다.")
         except Exception as e:
             st.error(f"재료 목록 로드 실패: {e}")
-            st.stop()
+            ingredient_options_kr = []
+            ing_kr_to_en_map = {}
+            ing_en_to_kr_map = {}
             
         all_menus_kr = MENU_MASTER_KR
         selected_menu_kr = st.selectbox(
@@ -4716,7 +4892,7 @@ elif menu == "재고 관리":
             for item in current_recipe_items:
                 sku_en = item.get("ingredient_en")
                 recipe_df_rows.append({
-                    "재료": ing_en_to_kr_map.get(sku_en, f"오류: {sku_en}?"),
+                    "재료": ing_en_to_kr_map.get(sku_en, to_korean_detail(sku_en)),
                     "수량": safe_float(item.get("qty", 0.0)),
                     "단위": normalize_uom(item.get("uom", "g")),
                     "손실률(%)": safe_float(item.get("waste_pct", 0.0)),
@@ -4726,13 +4902,17 @@ elif menu == "재고 관리":
         df_recipe_editor = pd.DataFrame(recipe_df_rows)
         with st.form(key="recipe_editor_form"):
             st.subheader(f"📝 `{selected_menu_kr}` 레시피 편집")
+            if ingredient_options_kr:
+                preview = ", ".join(ingredient_options_kr[:6])
+                suffix = " ..." if len(ingredient_options_kr) > 6 else ""
+                st.caption(f"기존 재료 예시: {preview}{suffix}")
             edited_df = st.data_editor(
                 df_recipe_editor,
                 column_config={
-                    "재료": st.column_config.SelectboxColumn("재료 (필수)", options=ingredient_options_kr, required=True),
-                    "수량": st.column_config.NumberColumn("수량", min_value=0.0, format="%.2f", required=True),
-                    "단위": st.column_config.SelectboxColumn("단위", options=["g", "ml", "ea"], required=True),
-                    "손실률(%)": st.column_config.NumberColumn("손실률(%)", min_value=0.0, max_value=100.0, format="%.1f %%", required=True),
+                    "재료": st.column_config.TextColumn("재료 (직접 입력)", required=False),
+                    "수량": st.column_config.NumberColumn("수량", min_value=0.0, format="%.2f", required=False),
+                    "단위": st.column_config.SelectboxColumn("단위", options=["g", "ml", "ea"], required=False),
+                    "손실률(%)": st.column_config.NumberColumn("손실률(%)", min_value=0.0, max_value=100.0, format="%.1f %%", required=False),
                 },
                 num_rows="dynamic",
                 use_container_width=True
@@ -4743,24 +4923,37 @@ elif menu == "재고 관리":
             final_ingredients = []
             valid = True
             for index, row in edited_df.iterrows():
-                재료_kr = row["재료"]
-                if not 재료_kr: 
-                    continue 
+                재료_kr = str(row.get("재료") or "").strip()
+                if not 재료_kr:
+                    continue
+                qty_val = safe_float(row.get("수량", 0.0))
+                if qty_val <= 0:
+                    continue
+                uom_val = normalize_uom(row.get("단위") or "g")
                 재료_en = ing_kr_to_en_map.get(재료_kr)
                 if not 재료_en:
-                    st.error(f"'{재료_kr}'는 유효한 재료가 아닙니다. '재료/원가 마스터' 탭을 확인하세요.")
-                    valid = False; break
+                    재료_en = ensure_inventory_ingredient(재료_kr, uom=uom_val)
+                    if 재료_en:
+                        ing_kr_to_en_map[재료_kr] = 재료_en
+                if not 재료_en:
+                    st.error(f"'{재료_kr}' 재료를 등록하는 데 실패했습니다.")
+                    valid = False
+                    break
                 final_ingredients.append({
                     "ingredient_en": 재료_en,
-                    "qty": safe_float(row["수량"]),
-                    "uom": normalize_uom(row["단위"]),
-                    "waste_pct": safe_float(row["손실률(%)"]),
+                    "qty": qty_val,
+                    "uom": uom_val,
+                    "waste_pct": safe_float(row.get("손실률(%)", 0.0)),
                 })
             if valid and not final_ingredients:
                 st.warning("저장할 재료가 없습니다. (모든 행이 비어있음)")
             elif valid and final_ingredients:
                 try:
-                    db.collection(RECIPES_COLLECTION).document(safe_doc_id(selected_menu_en)).set({"ingredients": final_ingredients})
+                    db.collection(RECIPES_COLLECTION).document(safe_doc_id(selected_menu_en)).set({
+                        "ingredients": final_ingredients,
+                        "menu_sku_en": selected_menu_en,
+                        "menu_name_ko": selected_menu_kr,
+                    }, merge=True)
                     clear_cache_safe(load_all_core_data, load_recipe)        
                     st.success(f"✅ `{selected_menu_kr}` 레시피가 성공적으로 저장되었습니다!")
                     st.balloons()
